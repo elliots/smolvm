@@ -422,6 +422,82 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Stop the VM process of a machine whose pause is in progress or done,
+    /// without resuming or shutting down its guest.
+    ///
+    /// After a durable pause (the record says Paused) the machine keeps its
+    /// checkpoint, which must verify, and a resume continues from it. A pause
+    /// still in progress (Pausing, with the guest frozen) is abandoned with
+    /// the guest's execution: its partial checkpoint is removed and the
+    /// machine is Stopped, so its next start boots afresh. When the VM process
+    /// has already exited, only the record changes. A machine that is neither
+    /// pausing nor paused, or whose guest runs, is refused.
+    pub fn stop_paused_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
+            let _source = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
+            let durable = match record.state {
+                RecordState::Paused => true,
+                RecordState::Pausing => false,
+                _ => {
+                    return Err(Error::InvalidState {
+                        expected: "pausing or paused".into(),
+                        actual: record.state.to_string(),
+                    })
+                }
+            };
+            if durable {
+                let path = record.paused_checkpoint.as_ref().ok_or_else(|| {
+                    Error::agent("stop paused machine", "paused machine has no checkpoint")
+                })?;
+                crate::portable_checkpoint::verify_resume_point(path)?;
+            }
+            if record.is_process_alive() {
+                let status = crate::agent::fork::control_socket_cmd(
+                    &crate::agent::fork::control_socket_path(name),
+                    "STATUS",
+                )?;
+                if status.trim() != "OK paused" {
+                    return Err(Error::agent_conflict(
+                        "stop paused machine",
+                        "the guest is running; use resume",
+                    ));
+                }
+                crate::agent::AgentManager::for_vm_with_sizes(
+                    name,
+                    record.storage_gb,
+                    record.overlay_gb,
+                )?
+                .stop_paused()?;
+            }
+            self.remove_cached_handle(name)?;
+            self.db.update_vm_durable(name, |record| {
+                record.pid = None;
+                record.pid_start_time = None;
+                if !durable {
+                    record.state = RecordState::Stopped;
+                    record.paused_checkpoint = None;
+                }
+            })?;
+            if let Some(partial) = record.paused_checkpoint.filter(|_| !durable) {
+                let removed = if partial.is_dir() {
+                    std::fs::remove_dir_all(&partial)
+                } else {
+                    std::fs::remove_file(&partial)
+                };
+                match removed {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "could not remove an abandoned pause artifact")
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Restore the saved execution under the original machine name.
     pub fn resume_machine(&self, name: &str) -> Result<()> {
         self.resume_machine_inner(name, false, None)
@@ -1939,6 +2015,51 @@ mod tests {
             .unwrap()
             .paused_checkpoint
             .is_some());
+    }
+
+    #[test]
+    fn stopping_a_pause_whose_vm_is_gone_abandons_it() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime
+            .create_machine(test_spec("abandoned", true))
+            .unwrap();
+        assert!(
+            runtime.stop_paused_machine("abandoned").is_err(),
+            "not pausing"
+        );
+        let point = tempfile::tempdir().unwrap();
+        let partial = point.path().join("pause.local.smolcheckpoint");
+        std::fs::create_dir(&partial).unwrap();
+        db.update_vm_durable("abandoned", |r| {
+            r.state = RecordState::Pausing;
+            r.paused_checkpoint = Some(partial.clone());
+        })
+        .unwrap();
+        runtime.stop_paused_machine("abandoned").unwrap();
+        let record = db.get_vm("abandoned").unwrap().unwrap();
+        assert_eq!(record.state, RecordState::Stopped);
+        assert!(record.paused_checkpoint.is_none());
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn a_durable_pause_is_stopped_only_when_its_checkpoint_verifies() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime
+            .create_machine(test_spec("unverified", true))
+            .unwrap();
+        let point = tempfile::tempdir().unwrap();
+        db.update_vm_durable("unverified", |r| {
+            r.state = RecordState::Paused;
+            r.paused_checkpoint = Some(point.path().to_path_buf());
+        })
+        .unwrap();
+        assert!(runtime.stop_paused_machine("unverified").is_err());
+        let record = db.get_vm("unverified").unwrap().unwrap();
+        assert_eq!(record.state, RecordState::Paused);
+        assert_eq!(record.paused_checkpoint.as_deref(), Some(point.path()));
     }
 
     // A command started through the embedded runtime sees what an exec through
