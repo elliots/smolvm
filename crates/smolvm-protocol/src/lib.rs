@@ -107,6 +107,8 @@ pub const GRACEFUL_WORKLOAD_STOP_CAPABILITY: &str = "graceful-workload-stop-v1";
 /// The agent forwards a detached workload's stdout and stderr to the host over
 /// [`ports::WORKLOAD_LOGS`].
 pub const WORKLOAD_LOGS_CAPABILITY: &str = "workload-logs-v1";
+/// The agent answers [`AgentRequest::SetClock`].
+pub const SET_CLOCK_CAPABILITY: &str = "set-clock-v1";
 
 /// Signal a machine's workload is sent when the machine stops, unless the
 /// machine names another one.
@@ -740,6 +742,15 @@ pub enum AgentRequest {
     /// occupies. Only the guest's allocator knows what the machine is using.
     MemoryStatus,
 
+    /// Step the guest's wall clock to the host's when the guest is more than
+    /// 50 ms behind it or more than 5 s ahead, and leave it alone otherwise.
+    /// A host sends this after a resume, before the guest serves anything.
+    /// The agent answers with a [`ClockStep`].
+    SetClock {
+        /// The host's `CLOCK_REALTIME`, in nanoseconds since the Unix epoch.
+        host_realtime_ns: u64,
+    },
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -1219,6 +1230,7 @@ impl AgentRequest {
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
+            AgentRequest::SetClock { .. } => "SetClock".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
@@ -1615,6 +1627,17 @@ impl MemoryStatus {
     pub fn used_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
     }
+}
+
+/// The agent's answer to [`AgentRequest::SetClock`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockStep {
+    /// The guest's wall clock minus the host's, in nanoseconds, as the agent
+    /// found it. Negative when the guest was behind.
+    pub skew_ns: i64,
+    /// Whether the agent stepped the guest's clock to the host's.
+    pub stepped: bool,
 }
 
 /// Storage status information.
@@ -2114,6 +2137,29 @@ mod tests {
             AgentRequest::PrepareFileAccess { image, workload_id }
                 if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
         ));
+    }
+
+    #[test]
+    fn set_clock_wire_format() {
+        let request = AgentRequest::SetClock {
+            host_realtime_ns: 1_760_000_000_123_456_789,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"method":"set_clock","host_realtime_ns":1760000000123456789}"#
+        );
+        assert_eq!(request.log_summary(), "SetClock");
+
+        let step = ClockStep {
+            skew_ns: -192_000_000_000,
+            stepped: true,
+        };
+        let reply = serde_json::to_string(&AgentResponse::ok_with_data(step)).unwrap();
+        assert_eq!(
+            reply,
+            r#"{"status":"ok","data":{"skewNs":-192000000000,"stepped":true}}"#
+        );
     }
 
     #[test]

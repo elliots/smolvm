@@ -78,15 +78,44 @@ fn run() {
 
         let host_ns = u64::from_le_bytes(buf);
         if host_ns.abs_diff(current_realtime_ns()) > DELTA_SYNC_NS {
-            let ts = libc::timespec {
-                tv_sec: (host_ns / NANOS_IN_SECOND) as libc::time_t,
-                tv_nsec: (host_ns % NANOS_IN_SECOND) as libc::c_long,
-            };
-            // SAFETY: ts is a valid timespec; the agent is PID-1 with CAP_SYS_TIME.
-            unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+            let _ = set_realtime_ns(host_ns);
         }
     }
     unsafe { libc::close(fd) };
+}
+
+/// A guest further behind the host than this is stepped by [`set_clock`].
+const MAX_BEHIND_NS: i64 = 50_000_000;
+/// A guest further ahead of the host than this is stepped by [`set_clock`].
+const MAX_AHEAD_NS: i64 = 5_000_000_000;
+
+/// Step the wall clock to the host's `host_ns` when the guest is more than
+/// 50 ms behind it or more than 5 s ahead. Small forward drift is left to the
+/// guest, so that a host whose timestamp is a little stale never moves the
+/// clock back.
+pub fn set_clock(host_ns: u64) -> std::io::Result<smolvm_protocol::ClockStep> {
+    let skew_ns = skew_ns(current_realtime_ns(), host_ns);
+    let stepped = !(-MAX_BEHIND_NS..=MAX_AHEAD_NS).contains(&skew_ns);
+    if stepped {
+        set_realtime_ns(host_ns)?;
+    }
+    Ok(smolvm_protocol::ClockStep { skew_ns, stepped })
+}
+
+fn skew_ns(guest_ns: u64, host_ns: u64) -> i64 {
+    (i128::from(guest_ns) - i128::from(host_ns)).clamp(i64::MIN.into(), i64::MAX.into()) as i64
+}
+
+fn set_realtime_ns(ns: u64) -> std::io::Result<()> {
+    let ts = libc::timespec {
+        tv_sec: (ns / NANOS_IN_SECOND) as libc::time_t,
+        tv_nsec: (ns % NANOS_IN_SECOND) as libc::c_long,
+    };
+    // SAFETY: ts is a valid timespec; the agent is PID-1 with CAP_SYS_TIME.
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn current_realtime_ns() -> u64 {
@@ -97,4 +126,33 @@ fn current_realtime_ns() -> u64 {
     // SAFETY: ts is a valid, writable timespec.
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     ts.tv_sec as u64 * NANOS_IN_SECOND + ts.tv_nsec as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skew_is_guest_minus_host() {
+        assert_eq!(skew_ns(10, 3), 7);
+        assert_eq!(skew_ns(3, 10), -7);
+        assert_eq!(skew_ns(u64::MAX, 0), i64::MAX);
+        assert_eq!(skew_ns(0, u64::MAX), i64::MIN);
+    }
+
+    // A host time inside the gate never steps the clock, so this needs no
+    // CAP_SYS_TIME.
+    #[test]
+    fn a_clock_inside_the_gate_is_left_alone() {
+        let now = current_realtime_ns();
+        let behind = set_clock(now + 40_000_000).unwrap();
+        assert!(!behind.stepped, "{behind:?}");
+        assert!(
+            behind.skew_ns < 0 && behind.skew_ns >= -MAX_BEHIND_NS,
+            "{behind:?}"
+        );
+        let ahead = set_clock(now - 4_000_000_000).unwrap();
+        assert!(!ahead.stepped, "{ahead:?}");
+        assert!(ahead.skew_ns > 3_900_000_000, "{ahead:?}");
+    }
 }

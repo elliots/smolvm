@@ -10,8 +10,8 @@ use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 pub use smolvm_protocol::WorkloadTarget;
 use smolvm_protocol::{
-    encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, MemoryStatus,
-    OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
+    encode_message, AgentRequest, AgentResponse, ClockStep, Envelope, FsNotifyEvent, ImageInfo,
+    MemoryStatus, OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
     FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION, WORKLOAD_TARGET_CAPABILITY,
 };
 use std::io::{Read, Write};
@@ -2183,6 +2183,16 @@ impl AgentClient {
     pub fn memory_status(&mut self) -> Result<MemoryStatus> {
         let resp = self.request(&AgentRequest::MemoryStatus)?;
         expect_data(resp, "memory status")
+    }
+
+    /// Step the guest's wall clock to `host_realtime_ns` (nanoseconds since
+    /// the Unix epoch) when the guest is more than 50 ms behind it or more
+    /// than 5 s ahead. Returns the skew the agent found and whether it
+    /// stepped. Agents without [`smolvm_protocol::SET_CLOCK_CAPABILITY`]
+    /// reject the request.
+    pub fn set_clock(&mut self, host_realtime_ns: u64) -> Result<ClockStep> {
+        let resp = self.request(&AgentRequest::SetClock { host_realtime_ns })?;
+        expect_data(resp, "set clock")
     }
 
     /// Test network connectivity directly from the agent (not via chroot).

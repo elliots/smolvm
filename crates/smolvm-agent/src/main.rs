@@ -2485,6 +2485,7 @@ fn handle_request(
         | AgentRequest::OnlineCpus { .. }
         | AgentRequest::OfflineCpus { .. }
         | AgentRequest::OnlineMemory { .. }
+        | AgentRequest::SetClock { .. }
         | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
@@ -2511,6 +2512,8 @@ fn handle_request(
             if attach::available() {
                 capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
             }
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::SET_CLOCK_CAPABILITY.to_string());
             // The guest kernel publishes this parameter when its timer driver
             // follows a change of counter rate after a restore.
             if std::path::Path::new("/sys/module/arm_arch_timer/parameters/follows_counter_rate")
@@ -2583,6 +2586,7 @@ fn handle_request(
         AgentRequest::ListAttachedMounts => AgentResponse::Ok {
             data: serde_json::to_value(attach::list()).ok(),
         },
+        AgentRequest::SetClock { host_realtime_ns } => handle_set_clock(host_realtime_ns),
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();
@@ -7935,6 +7939,19 @@ fn handle_storage_status() -> AgentResponse {
 /// `MemAvailable` predates some very old kernels.
 fn handle_memory_status() -> AgentResponse {
     AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
+}
+
+fn handle_set_clock(host_realtime_ns: u64) -> AgentResponse {
+    #[cfg(target_os = "linux")]
+    return AgentResponse::from_result(
+        timesync::set_clock(host_realtime_ns),
+        error_codes::INTERNAL_ERROR,
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = host_realtime_ns;
+        AgentResponse::error("SetClock needs a Linux guest", error_codes::INVALID_REQUEST)
+    }
 }
 
 /// Parse the `Key:  value kB` lines of a meminfo file into bytes.
