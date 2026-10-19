@@ -398,10 +398,16 @@ impl EmbeddedRuntime {
             let record = control::get_record(&self.db, name)?;
             if let Some(operation) = operation {
                 if !self.db.pause_operation_is_active(name, operation)? {
-                    if self.db.pause_operation_was_consumed(name, operation)? && record.paused_checkpoint.is_none() && record.is_process_alive() {
+                    if self.db.pause_operation_was_consumed(name, operation)?
+                        && record.paused_checkpoint.is_none()
+                        && record.is_process_alive()
+                    {
                         return Ok(());
                     }
-                    return Err(Error::agent_conflict("resume machine", "this is not the machine's active pause operation"));
+                    return Err(Error::agent_conflict(
+                        "resume machine",
+                        "this is not the machine's active pause operation",
+                    ));
                 }
             }
             if record.paused_checkpoint.is_none() {
@@ -409,7 +415,10 @@ impl EmbeddedRuntime {
                     self.db.finish_saved_execution(name, |_| {})?;
                     return Ok(());
                 }
-                return Err(Error::agent_conflict("resume machine", "machine is not paused; use start for a fresh boot"));
+                return Err(Error::agent_conflict(
+                    "resume machine",
+                    "machine is not paused; use start for a fresh boot",
+                ));
             }
             if record.is_process_alive() {
                 let control_socket = crate::agent::fork::control_socket_path(name);
@@ -418,8 +427,11 @@ impl EmbeddedRuntime {
                     // The capture owner exited before committing durability.
                     // Recover the original rather than replaying an uncertain artifact.
                     if status.trim() == "OK paused" {
-                        let reply = crate::agent::fork::control_socket_cmd(&control_socket, "RESUME")?;
-                        if !reply.starts_with("OK") { return Err(Error::agent("resume interrupted pause", reply)); }
+                        let reply =
+                            crate::agent::fork::control_socket_cmd(&control_socket, "RESUME")?;
+                        if !reply.starts_with("OK") {
+                            return Err(Error::agent("resume interrupted pause", reply));
+                        }
                     } else if status.trim() != "OK running" {
                         return Err(Error::agent("resume interrupted pause", status));
                     }
@@ -430,9 +442,17 @@ impl EmbeddedRuntime {
                     return Ok(());
                 }
                 if status.trim() != "OK paused" {
-                    return Err(Error::agent_conflict("resume machine", "source is still running; refusing to replace its execution"));
+                    return Err(Error::agent_conflict(
+                        "resume machine",
+                        "source is still running; refusing to replace its execution",
+                    ));
                 }
-                crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
+                crate::agent::AgentManager::for_vm_with_sizes(
+                    name,
+                    record.storage_gb,
+                    record.overlay_gb,
+                )?
+                .stop_paused()?;
             }
             self.remove_cached_handle(name)?;
             crate::portable_checkpoint::prepare_paused_restore(&record)?;
@@ -444,15 +464,10 @@ impl EmbeddedRuntime {
             }
             // A successfully resumed VM owns its installed RAM/disk backing;
             // the transport artifact is no longer its recovery authority.
+            // A caller that keeps the machine's handle outlives the deletion;
+            // a detached one (the CLI) may exit first, so it deletes in place.
             if let Some(path) = record.paused_checkpoint {
-                let removed = if path.is_dir() {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-                if let Err(error) = removed {
-                    tracing::warn!(%error, path = %path.display(), "could not remove consumed pause artifact");
-                }
+                crate::portable_checkpoint::discard_consumed_resume_point(&path, !detached);
             }
             let vm_data = crate::agent::vm_data_dir(name);
             if let Err(error) = crate::portable_checkpoint::remove_paused_layers(&vm_data) {

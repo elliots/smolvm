@@ -6720,6 +6720,17 @@ fn paused_restore_staging_bytes(
 /// and leaving it makes the new restore refuse to retain its own, so a machine
 /// restored from a checkpoint could be paused but never resumed.
 fn clear_stale_restore_state(vm_data: &Path) -> Result<()> {
+    if let Ok(entries) = std::fs::read_dir(vm_data) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(CONSUMED_PREFIX)
+            {
+                remove_resume_point(&entry.path());
+            }
+        }
+    }
     match std::fs::remove_dir_all(vm_data.join(INSTALLED_DIR)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -6732,6 +6743,55 @@ fn clear_stale_restore_state(vm_data: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// Name prefix of a consumed resume point that is still being deleted.
+const CONSUMED_PREFIX: &str = ".consumed-";
+
+/// Remove a resume point that a resume consumed. With `background`, it is
+/// renamed out of the way and deleted on a thread, off the caller's path:
+/// freeing a RAM image of a gigabyte takes tens of milliseconds. A deletion
+/// that the process's exit cuts short leaves the renamed copy for the next
+/// restore of the machine (see `clear_stale_restore_state`), or its deletion,
+/// to remove.
+pub fn discard_consumed_resume_point(path: &Path, background: bool) {
+    let renamed = if background {
+        path.file_name().and_then(|name| {
+            let trash = path.with_file_name(format!("{CONSUMED_PREFIX}{}", name.to_string_lossy()));
+            std::fs::rename(path, &trash).ok().map(|()| trash)
+        })
+    } else {
+        None
+    };
+    let Some(trash) = renamed else {
+        remove_resume_point(path);
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("discard-resume-point".into())
+        .spawn({
+            let trash = trash.clone();
+            move || remove_resume_point(&trash)
+        })
+    {
+        tracing::warn!(%error, "could not start removing the consumed resume point");
+        remove_resume_point(&trash);
+    }
+}
+
+fn remove_resume_point(path: &Path) {
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "could not remove consumed pause artifact")
+        }
+    }
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.
@@ -7554,6 +7614,35 @@ mod tests {
             .unwrap();
         let error = read_local_checkpoint(&dir).unwrap_err().to_string();
         assert!(error.contains("changed after the pause"), "{error}");
+    }
+
+    #[test]
+    fn a_consumed_resume_point_is_removed_now_or_after_a_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let vm = temp.path();
+        let artifact = vm.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        discard_consumed_resume_point(&artifact, false);
+        assert!(!artifact.exists());
+
+        let local = vm.join("pause-2.local.smolcheckpoint");
+        std::fs::create_dir_all(local.join(ASSET_DIR)).unwrap();
+        std::fs::write(local.join(ASSET_DIR).join("memory.bin"), b"RAM").unwrap();
+        discard_consumed_resume_point(&local, true);
+        assert!(!local.exists(), "renamed out of the way at once");
+        let trash = vm.join(format!("{CONSUMED_PREFIX}pause-2.local.smolcheckpoint"));
+        for _ in 0..200 {
+            if !trash.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!trash.exists(), "deleted in the background");
+
+        // A deletion cut short leaves the renamed copy for the next restore.
+        std::fs::create_dir_all(&trash).unwrap();
+        clear_stale_restore_state(vm).unwrap();
+        assert!(!trash.exists());
     }
 
     #[test]
