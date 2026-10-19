@@ -174,6 +174,7 @@ impl CheckpointCmd {
                 staging_dir: self.staging_dir,
                 lib_dir: self.lib_dir,
                 rootfs_dir: self.rootfs_dir,
+                local: false,
             },
             self.history,
         )?;

@@ -742,6 +742,262 @@ pub struct CaptureOptions {
     pub lib_dir: Option<PathBuf>,
     /// Directory containing the guest agent root filesystem.
     pub rootfs_dir: Option<PathBuf>,
+    /// Keep a pause's files unpacked in a directory at the output path, for a
+    /// resume on this host only (see [`LOCAL_CHECKPOINT_MANIFEST`]).
+    pub local: bool,
+}
+
+/// The file describing a local checkpoint: a directory a pause leaves with
+/// the files the VMM saved, unpacked, so that a resume on the same host hands
+/// them to the VMM without extracting and verifying an archive. It holds the
+/// checkpoint's manifest, as an artifact would, and the identity of its RAM
+/// image (see [`LocalCheckpoint`]).
+pub const LOCAL_CHECKPOINT_MANIFEST: &str = "local-checkpoint.json";
+
+/// What a local checkpoint records about itself.
+///
+/// The VMM's state and the memory layout keep their SHA-256 in the manifest,
+/// and the installer checks both, as it does for an artifact: the VMM parses
+/// them. The RAM image's bytes are hashed once, when the pause seals them, and
+/// the digest is bound to the image's inode, as an `ArtifactDigestProof` is:
+/// while the inode is the one the pause recorded, with the same size and
+/// modification time (`same_checkpoint_across_links`), the digest stands in for
+/// a full read, and a resume reads none of it. Any other inode is read in full
+/// and must match the digest. The image is read-only, service-owned, and
+/// tagged as immutable checkpoint backing, so that no launch hands it to a
+/// VMM's uid.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalCheckpoint {
+    /// Format of this record.
+    pub version: u32,
+    /// The manifest an artifact of this pause would carry.
+    pub manifest: PackManifest,
+    /// The RAM image's file identity when the pause recorded it.
+    pub memory: LocalFileIdentity,
+    /// SHA-256 of each piece of the RAM image that holds data, in order.
+    pub memory_pieces: Vec<LocalPieceDigest>,
+}
+
+/// The SHA-256 of `len` bytes at `offset` of a sparse file. Holes between
+/// pieces read as zeros and are covered by the pieces' offsets.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalPieceDigest {
+    /// Offset of the piece in the file.
+    pub offset: u64,
+    /// Length of the piece.
+    pub len: u64,
+    /// Lowercase hex SHA-256 of its bytes.
+    pub sha256: String,
+}
+
+/// Digests of the data in `file`, in pieces of at most 64 MiB, hashed on four
+/// threads.
+#[cfg(unix)]
+fn sparse_piece_digests(file: &std::fs::File) -> Result<Vec<LocalPieceDigest>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    const PIECE: u64 = 64 << 20;
+    let len = file.metadata()?.len();
+    let fd = file.as_raw_fd();
+    let mut pieces = Vec::new();
+    let mut offset = 0u64;
+    while offset < len {
+        let data = unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(error.into());
+        }
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let (mut at, end) = (data as u64, (hole as u64).min(len));
+        while at < end {
+            let piece = (end - at).min(PIECE);
+            pieces.push((at, piece));
+            at += piece;
+        }
+        offset = end;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let hash = || -> Result<Vec<(usize, String)>> {
+        let mut done = Vec::new();
+        let mut buffer = vec![0_u8; 4 << 20];
+        loop {
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(&(start, piece)) = pieces.get(index) else {
+                return Ok(done);
+            };
+            // ring uses the CPU's SHA-256 instructions: several times the
+            // speed of the portable code here.
+            let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+            let mut at = 0u64;
+            while at < piece {
+                let chunk = (piece - at).min(buffer.len() as u64) as usize;
+                file.read_exact_at(&mut buffer[..chunk], start + at)?;
+                hasher.update(&buffer[..chunk]);
+                at += chunk as u64;
+            }
+            done.push((index, hex::encode(hasher.finish())));
+        }
+    };
+    let mut digests = vec![String::new(); pieces.len()];
+    std::thread::scope(|scope| -> Result<()> {
+        let workers: Vec<_> = (0..4).map(|_| scope.spawn(hash)).collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .map_err(|_| Error::agent("hash RAM image", "hash thread panicked"))??;
+            for (index, digest) in done {
+                digests[index] = digest;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(pieces
+        .into_iter()
+        .zip(digests)
+        .map(|((offset, len), sha256)| LocalPieceDigest {
+            offset,
+            len,
+            sha256,
+        })
+        .collect())
+}
+
+/// A file's identity: what changes if it is written, replaced or truncated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalFileIdentity {
+    /// Device of the file system holding it.
+    pub dev: u64,
+    /// Inode number.
+    pub ino: u64,
+    /// Length in bytes.
+    pub size: u64,
+    /// Last modification, in nanoseconds since the epoch.
+    pub mtime_ns: i128,
+}
+
+#[cfg(unix)]
+impl LocalFileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.len(),
+            mtime_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                + i128::from(metadata.mtime_nsec()),
+        }
+    }
+}
+
+/// Write `dir`'s record and make every file and directory in it durable.
+#[cfg(unix)]
+fn seal_local_checkpoint(dir: &Path, manifest: &PackManifest) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = dir.join(ASSET_DIR).join("memory.bin");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+    // A resume links the image in as the VM's read-only restore input and
+    // then hands the VM's directory, this checkpoint included, to the VMM's
+    // uid. The tag keeps the image the service's own (see `chown_tree`).
+    #[cfg(target_os = "linux")]
+    if !crate::process::mark_checkpoint_backing(&std::fs::File::open(&path)?)? {
+        return Err(Error::agent(
+            "seal local checkpoint",
+            "the file system cannot tag the RAM image as immutable",
+        ));
+    }
+    let file = std::fs::File::open(&path)?;
+    let memory_pieces = sparse_piece_digests(&file)?;
+    let memory = file
+        .metadata()
+        .map_err(|e| Error::agent("seal local checkpoint", e.to_string()))?;
+    let record = LocalCheckpoint {
+        version: 1,
+        manifest: manifest.clone(),
+        memory: LocalFileIdentity::of(&memory),
+        memory_pieces,
+    };
+    let json = serde_json::to_vec(&record)
+        .map_err(|e| Error::agent("seal local checkpoint", e.to_string()))?;
+    std::fs::write(dir.join(LOCAL_CHECKPOINT_MANIFEST), json)?;
+    sync_tree(dir)
+}
+
+/// fsync every regular file and directory under `dir`, `dir` last.
+#[cfg(unix)]
+fn sync_tree(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            sync_tree(&entry.path())?;
+        } else if kind.is_file() {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Read a local checkpoint's record, refusing a RAM image that is not the
+/// service's own or whose bytes changed since the pause.
+#[cfg(unix)]
+pub fn read_local_checkpoint(dir: &Path) -> Result<LocalCheckpoint> {
+    use std::os::unix::fs::MetadataExt;
+    let invalid = |reason: &str| Error::agent("read local checkpoint", reason.to_string());
+    let euid = unsafe { libc::geteuid() };
+    let record: LocalCheckpoint =
+        serde_json::from_slice(&std::fs::read(dir.join(LOCAL_CHECKPOINT_MANIFEST))?)
+            .map_err(|e| invalid(&e.to_string()))?;
+    if record.version != 1 {
+        return Err(invalid("unknown local checkpoint version"));
+    }
+    let checkpoint = record
+        .manifest
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| invalid("the manifest has no execution state"))?;
+    let path = dir.join(ASSET_DIR).join("memory.bin");
+    let memory = std::fs::symlink_metadata(&path)?;
+    if !memory.is_file() || memory.uid() != euid || memory.mode() & 0o022 != 0 {
+        return Err(invalid("the RAM image must be a protected regular file"));
+    }
+    if memory.len() != checkpoint.memory.size || memory.len() != record.memory.size {
+        return Err(invalid("the RAM image changed after the pause"));
+    }
+    // The inode the pause hashed stands in for a full read; any other is read.
+    if LocalFileIdentity::of(&memory) != record.memory {
+        let file = std::fs::File::open(&path)?;
+        if sparse_piece_digests(&file)? != record.memory_pieces {
+            return Err(invalid("the RAM image changed after the pause"));
+        }
+        tracing::info!(path = %path.display(), "local checkpoint RAM image verified by a full read");
+    }
+    Ok(record)
+}
+
+#[cfg(not(unix))]
+pub fn read_local_checkpoint(_dir: &Path) -> Result<LocalCheckpoint> {
+    Err(Error::agent(
+        "read local checkpoint",
+        "local checkpoints are unix-only",
+    ))
+}
+
+/// Check a paused machine's resume point: a local checkpoint directory or a
+/// checkpoint artifact.
+pub fn verify_resume_point(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        read_local_checkpoint(path).map(|_| ())
+    } else {
+        verified_sidecar_footer(path).map(|_| ())
+    }
 }
 
 /// Timings and size returned by a completed portable checkpoint capture.
@@ -1973,6 +2229,12 @@ fn capture_with_completion(
             "output must end in .checkpoint",
         ));
     }
+    if options.local && (!stop_after_capture || options.store_dir.is_some() || cfg!(not(unix))) {
+        return Err(Error::config(
+            "checkpoint machine",
+            "only a pause on unix keeps a local checkpoint",
+        ));
+    }
     if output.exists() {
         return Err(Error::config(
             "checkpoint machine",
@@ -2615,6 +2877,40 @@ fn capture_with_completion(
         }
         drop(source_lock.take());
         release_source.take().unwrap()();
+    }
+
+    // A local pause keeps the staging tree as it is: the files the VMM wrote,
+    // the disk layers staged above, and the manifest. Backing layers become
+    // files, as a store needs them, so a resume can install them.
+    #[cfg(unix)]
+    if options.local {
+        if let Some(deferred) = deferred_backings {
+            deferred.stage_copies()?;
+        }
+        seal_local_checkpoint(&staging_dir, &manifest)?;
+        std::fs::rename(&staging_dir, output)
+            .map_err(|e| Error::agent("publish local checkpoint", e.to_string()))?;
+        if let Some(parent) = output.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        log_phase(name, "capture_local", &mut phase);
+        if let Some(pins) = &pins {
+            pins.commit(output)?;
+        }
+        publish_resume_point(PauseCaptureStage::Durable)?;
+        pause.stop(name, vm)?;
+        record_paused_disks(
+            &crate::agent::vm_data_dir(name),
+            output,
+            captured_disks.as_deref(),
+        );
+        set_checkpoint_head(name, &checkpoint_id);
+        return Ok(CaptureResult {
+            reused_bytes: 0,
+            size_bytes: 0,
+            source_pause: pause_started.elapsed(),
+            elapsed: started.elapsed(),
+        });
     }
 
     if let Some((directory, mut writer)) = stored {
@@ -6245,6 +6541,9 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             "source VM has not stopped",
         ));
     }
+    if artifact.is_dir() {
+        return prepare_local_restore(record, artifact);
+    }
     let footer = ensure_checkpoint_layout(artifact)?;
     // Treat this manifest as untrusted until extraction verifies the full
     // sidecar checksum. No machine state changes before that verification.
@@ -6352,6 +6651,41 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         }
     }
     extract_and_install(&vm_data)
+}
+
+/// Install a local checkpoint for a resume: what [`prepare_paused_restore`]
+/// does with an artifact, with the checkpoint's own directory in place of its
+/// extraction. The directory stays intact until the resume succeeds.
+fn prepare_local_restore(record: &VmRecord, dir: &Path) -> Result<()> {
+    let mut phase = std::time::Instant::now();
+    let local = read_local_checkpoint(dir)?;
+    let checkpoint = local
+        .manifest
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| Error::agent("resume machine", "checkpoint has no execution state"))?;
+    validate_compatibility(checkpoint)?;
+    let cache_base = resolve_cache_base(checkpoint, record.cache_disk.as_ref())?;
+    let vm_data = crate::agent::vm_data_dir(&record.name);
+    let keep_disks = paused_disks_intact(&vm_data, dir, &checkpoint.disks);
+    tracing::info!(machine = %record.name, keep_disks, "paused resume disks");
+    if !keep_disks {
+        for layer in paused_layers(&vm_data, dir)? {
+            install_pinned_layer(&vm_data, &layer, dir)?;
+        }
+    }
+    log_phase(&record.name, "restore_local_verify", &mut phase);
+    clear_stale_restore_state(&vm_data)?;
+    install_with(
+        dir,
+        &vm_data,
+        checkpoint,
+        keep_disks,
+        cache_base.as_deref(),
+        None,
+    )?;
+    log_phase(&record.name, "restore_local_install", &mut phase);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -7163,6 +7497,63 @@ mod tests {
         assert!(!retained.exists());
         std::fs::write(snapshot.join("memory.bin"), b"private RAM").unwrap();
         assert_eq!(std::fs::read(source.path()).unwrap(), b"immutable RAM");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_local_checkpoint_refuses_a_ram_image_changed_after_the_pause() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pause-1.local.smolcheckpoint");
+        std::fs::create_dir_all(dir.join(ASSET_DIR)).unwrap();
+        let memory = dir.join(ASSET_DIR).join("memory.bin");
+        std::fs::write(&memory, b"guest RAM").unwrap();
+        let mut manifest = PackManifest::new(
+            "vm://local-test".into(),
+            "none".into(),
+            "linux/arm64".into(),
+            "linux/arm64".into(),
+        );
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.memory.size = 9;
+        manifest.checkpoint = Some(checkpoint);
+        match seal_local_checkpoint(&dir, &manifest) {
+            Ok(()) => {}
+            // Only a file system with user xattrs keeps a local checkpoint.
+            Err(error) if error.to_string().contains("cannot tag") => return,
+            Err(error) => panic!("{error}"),
+        }
+        let mode = std::fs::metadata(&memory).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444, "the RAM image is read-only");
+        let record = read_local_checkpoint(&dir).unwrap();
+        assert_eq!(record.memory.size, 9);
+        // A second link, as a resume's read-only input adds, changes nothing.
+        std::fs::hard_link(&memory, temp.path().join("input.bin")).unwrap();
+        read_local_checkpoint(&dir).unwrap();
+
+        assert_eq!(record.memory_pieces.len(), 1);
+        std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            read_local_checkpoint(&dir).is_err(),
+            "a writable image is refused"
+        );
+        std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Another inode with the same bytes passes a full read.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let copy = temp.path().join("copy.bin");
+        std::fs::copy(&memory, &copy).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::rename(&copy, &memory).unwrap();
+        read_local_checkpoint(&dir).unwrap();
+        // Past the file system's timestamp granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&memory)
+            .and_then(|mut file| file.write_all(b"G"))
+            .unwrap();
+        let error = read_local_checkpoint(&dir).unwrap_err().to_string();
+        assert!(error.contains("changed after the pause"), "{error}");
     }
 
     #[test]

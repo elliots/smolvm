@@ -199,7 +199,15 @@ impl EmbeddedRuntime {
 
     /// Save execution durably and stop at that exact boundary.
     pub fn pause_machine(&self, name: &str) -> Result<()> {
-        self.pause_machine_inner(name, None)
+        self.pause_machine_inner(name, None, false)
+    }
+
+    /// [`Self::pause_machine`], keeping the saved execution as a local
+    /// checkpoint: plain files that only a resume on this host can use, which
+    /// it starts from without extracting or verifying an archive. Such a pause
+    /// cannot be exported.
+    pub fn pause_machine_local(&self, name: &str) -> Result<()> {
+        self.pause_machine_inner(name, None, true)
     }
 
     /// Retry a durable pause without ever pausing a later resumed execution.
@@ -215,10 +223,10 @@ impl EmbeddedRuntime {
                 "invalid pause operation identifier",
             ));
         }
-        self.pause_machine_inner(name, Some(operation))
+        self.pause_machine_inner(name, Some(operation), false)
     }
 
-    fn pause_machine_inner(&self, name: &str, operation: Option<&str>) -> Result<()> {
+    fn pause_machine_inner(&self, name: &str, operation: Option<&str>, local: bool) -> Result<()> {
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let mut record = control::get_record(&self.db, name)?;
@@ -255,7 +263,7 @@ impl EmbeddedRuntime {
                     let path = record.paused_checkpoint.as_ref().ok_or_else(|| {
                         Error::agent("pause machine", "saved execution is missing")
                     })?;
-                    crate::portable_checkpoint::verified_sidecar_footer(path)?;
+                    crate::portable_checkpoint::verify_resume_point(path)?;
                     let status = crate::agent::fork::control_socket_cmd(
                         &crate::agent::fork::control_socket_path(name),
                         "STATUS",
@@ -279,7 +287,7 @@ impl EmbeddedRuntime {
                 let path = record.paused_checkpoint.as_ref().ok_or_else(|| {
                     Error::agent("pause machine", "paused machine has no checkpoint")
                 })?;
-                crate::portable_checkpoint::verified_sidecar_footer(path)?;
+                crate::portable_checkpoint::verify_resume_point(path)?;
                 return Ok(());
             }
             if record.paused_checkpoint.is_some() {
@@ -289,12 +297,14 @@ impl EmbeddedRuntime {
                 ));
             }
             let output = crate::agent::vm_data_dir(name).join(format!(
-                "pause-{}.smolcheckpoint",
-                crate::db::SmolvmDb::create_reservation_token()
+                "pause-{}.{}smolcheckpoint",
+                crate::db::SmolvmDb::create_reservation_token(),
+                if local { "local." } else { "" }
             ));
             // A paused machine resumes on this host, so its host mounts come along.
             let pause_options = crate::portable_checkpoint::CaptureOptions {
                 host_mounts: true,
+                local,
                 ..Default::default()
             };
             let result = crate::portable_checkpoint::capture_and_stop_to_path(
@@ -335,7 +345,12 @@ impl EmbeddedRuntime {
                         }
                     })?;
                     if output.exists() {
-                        if let Err(cleanup) = std::fs::remove_file(&output) {
+                        let removed = if output.is_dir() {
+                            std::fs::remove_dir_all(&output)
+                        } else {
+                            std::fs::remove_file(&output)
+                        };
+                        if let Err(cleanup) = removed {
                             tracing::warn!(%cleanup, "could not remove failed pause artifact");
                         }
                     }
@@ -430,7 +445,12 @@ impl EmbeddedRuntime {
             // A successfully resumed VM owns its installed RAM/disk backing;
             // the transport artifact is no longer its recovery authority.
             if let Some(path) = record.paused_checkpoint {
-                if let Err(error) = std::fs::remove_file(&path) {
+                let removed = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if let Err(error) = removed {
                     tracing::warn!(%error, path = %path.display(), "could not remove consumed pause artifact");
                 }
             }
