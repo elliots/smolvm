@@ -78,6 +78,39 @@ pub enum PauseOutcome {
     Cancelled,
 }
 
+/// A machine's record, VM process and resume point, read without starting or
+/// connecting to it. See [`EmbeddedRuntime::inspect_machine`].
+#[derive(Clone, Debug)]
+pub struct MachineInspection {
+    /// The state the record holds. A Running record whose VM process has
+    /// exited still says Running: see `process_alive`.
+    pub state: RecordState,
+    /// The VM process the record names.
+    pub pid: Option<i32>,
+    /// That process's start time, which tells it from a later process that
+    /// reuses the pid.
+    pub pid_start_time: Option<u64>,
+    /// Whether that process still runs.
+    pub process_alive: bool,
+    /// The resume point of a pausing or paused machine.
+    pub resume_point: Option<ResumePointInspection>,
+}
+
+/// The resume point of a pausing or paused machine.
+#[derive(Clone, Debug)]
+pub struct ResumePointInspection {
+    /// A local checkpoint directory or a checkpoint artifact.
+    pub path: std::path::PathBuf,
+    /// Why it fails [`crate::portable_checkpoint::verify_resume_point`], or
+    /// `None` when it passes. A pause still in progress fails it, because its
+    /// checkpoint is not complete.
+    pub verify_error: Option<String>,
+    /// Bytes in its files.
+    pub size_bytes: u64,
+    /// Bytes its files take on disk. A RAM image is sparse.
+    pub allocated_bytes: u64,
+}
+
 /// How [`EmbeddedRuntime::stop_machine_with`] and
 /// [`EmbeddedRuntime::delete_machine_with`] treat work still running on the
 /// machine.
@@ -1731,6 +1764,35 @@ impl EmbeddedRuntime {
         self.db.get_vm(name)
     }
 
+    /// The record, VM process and resume point of `name`, or `None` when no
+    /// such machine exists. It never waits on the machine. It reads the
+    /// database, `/proc` and the resume point's metadata, and reads a local
+    /// checkpoint's whole RAM image only if it is not the file the pause
+    /// sealed.
+    pub fn inspect_machine(&self, name: &str) -> Result<Option<MachineInspection>> {
+        let Some(record) = self.db.get_vm(name)? else {
+            return Ok(None);
+        };
+        let resume_point = record.paused_checkpoint.as_ref().map(|path| {
+            let (size_bytes, allocated_bytes) = resume_point_size(path);
+            ResumePointInspection {
+                path: path.clone(),
+                verify_error: crate::portable_checkpoint::verify_resume_point(path)
+                    .err()
+                    .map(|error| error.to_string()),
+                size_bytes,
+                allocated_bytes,
+            }
+        });
+        Ok(Some(MachineInspection {
+            process_alive: record.is_process_alive(),
+            state: record.state,
+            pid: record.pid,
+            pid_start_time: record.pid_start_time,
+            resume_point,
+        }))
+    }
+
     /// Get the current machine state as a string.
     pub fn state(&self, name: &str) -> String {
         if let Ok(Some(record)) = self.db.get_vm(name) {
@@ -1890,6 +1952,33 @@ fn run_bundled_cli(args: &[&std::ffi::OsStr]) -> Result<()> {
     Err(Error::agent(operation, reason))
 }
 
+/// The bytes in the files at `path`, and the bytes they take on disk.
+fn resume_point_size(path: &std::path::Path) -> (u64, u64) {
+    fn add(path: &std::path::Path, total: &mut (u64, u64)) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                add(&entry.path(), total);
+            }
+        } else if metadata.is_file() {
+            total.0 += metadata.len();
+            #[cfg(unix)]
+            {
+                total.1 += std::os::unix::fs::MetadataExt::blocks(&metadata) * 512;
+            }
+            #[cfg(not(unix))]
+            {
+                total.1 += metadata.len();
+            }
+        }
+    }
+    let mut total = (0, 0);
+    add(path, &mut total);
+    total
+}
+
 fn lock_handle(handle: &SharedHandle) -> Result<MutexGuard<'_, VmHandle>> {
     handle
         .lock()
@@ -2015,6 +2104,38 @@ mod tests {
             .unwrap()
             .paused_checkpoint
             .is_some());
+    }
+
+    #[test]
+    fn inspect_reports_the_record_and_its_resume_point() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        assert!(runtime.inspect_machine("inspected").unwrap().is_none());
+        runtime
+            .create_machine(test_spec("inspected", true))
+            .unwrap();
+        let point = tempfile::tempdir().unwrap();
+        std::fs::write(point.path().join("memory.bin"), [1u8; 4096]).unwrap();
+        db.update_vm_durable("inspected", |r| {
+            r.state = RecordState::Paused;
+            r.paused_checkpoint = Some(point.path().to_path_buf());
+            r.pid = Some(i32::MAX);
+            r.pid_start_time = Some(1);
+        })
+        .unwrap();
+        let inspection = runtime.inspect_machine("inspected").unwrap().unwrap();
+        assert_eq!(inspection.state, RecordState::Paused);
+        assert_eq!(inspection.pid, Some(i32::MAX));
+        assert_eq!(inspection.pid_start_time, Some(1));
+        assert!(!inspection.process_alive);
+        let resume_point = inspection.resume_point.unwrap();
+        assert_eq!(resume_point.path, point.path());
+        assert_eq!(resume_point.size_bytes, 4096);
+        assert!(resume_point.allocated_bytes >= 4096);
+        assert!(
+            resume_point.verify_error.is_some(),
+            "it has no sealed record"
+        );
     }
 
     #[test]

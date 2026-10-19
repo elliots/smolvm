@@ -12,7 +12,8 @@ pub use crate::portable_checkpoint::{PauseControl, PauseStage};
 pub use control::MachineSpec;
 pub use exec::{ExecCancel, ExecOptions};
 pub use runtime::{
-    runtime, EmbeddedRuntime, PauseOutcome, ResizeSpec, RestoreOptions, StopOptions,
+    runtime, EmbeddedRuntime, MachineInspection, PauseOutcome, ResizeSpec, RestoreOptions,
+    ResumePointInspection, StopOptions,
 };
 
 /// Parse the trusted loopback interceptor binding supplied by an SDK caller.
