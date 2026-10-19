@@ -186,10 +186,12 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     if let Some(snapshot) = std::env::var_os("SMOLVM_SNAPSHOT_DIR").map(PathBuf::from) {
         if crate::portable_checkpoint::has_readonly_memory(&snapshot) {
             use std::os::fd::IntoRawFd;
-            if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1") {
+            if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1")
+                && !crate::portable_checkpoint::libkrun_reads_restore_memory()
+            {
                 return Err(crate::Error::agent(
                     "prepare restore RAM",
-                    "read-only input requires branchable restore",
+                    "read-only input requires a branchable restore or a libkrun that reads restore memory",
                 ));
             }
             let vm_dir = config.storage_disk_path.parent().ok_or_else(|| {

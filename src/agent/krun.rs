@@ -160,6 +160,10 @@ pub struct KrunFunctions {
     pub set_snapshot_memory_fd: Option<unsafe extern "C" fn(u32, i32) -> i32>,
     /// Opt into immutable backing retained across restored branches.
     pub set_snapshot_memory_fd2: Option<unsafe extern "C" fn(u32, i32, u32) -> i32>,
+    /// Present, and returning 1, when a restore that is not branchable reads
+    /// its RAM into anonymous memory, so a read-only memory input needs no
+    /// private copy.
+    pub restore_reads_memory: Option<unsafe extern "C" fn() -> i32>,
     /// Create a qcow2 copy-on-write overlay backed by an existing disk image
     /// (used for fork-clone block disks). Pure filesystem op; takes no ctx.
     pub create_disk_overlay:
@@ -260,6 +264,7 @@ impl KrunFunctions {
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
         let set_snapshot_memory_fd2 = load_optional_sym!("krun_set_snapshot_memory_fd2");
+        let restore_reads_memory = load_optional_sym!("krun_restore_reads_memory");
         let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
 
         Ok(Self {
@@ -300,6 +305,7 @@ impl KrunFunctions {
             set_snapshot,
             set_snapshot_memory_fd,
             set_snapshot_memory_fd2,
+            restore_reads_memory,
             create_disk_overlay,
         })
     }

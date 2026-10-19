@@ -170,6 +170,21 @@ fn readonly_restore_supported() -> bool {
         .is_some_and(|krun| krun.set_snapshot_memory_fd.is_some())
 }
 
+/// Whether this host's libkrun restores a machine that is not branchable from
+/// a read-only RAM input, reading it into anonymous memory: then such a resume
+/// needs no private, writable copy of its RAM image.
+#[cfg(target_os = "linux")]
+pub(crate) fn libkrun_reads_restore_memory() -> bool {
+    crate::agent::find_lib_dir()
+        .and_then(|dir| unsafe { crate::agent::KrunFunctions::load(&dir) }.ok())
+        .is_some_and(|krun| {
+            krun.set_snapshot_memory_fd.is_some()
+                && krun
+                    .restore_reads_memory
+                    .is_some_and(|reads| unsafe { reads() } == 1)
+        })
+}
+
 /// Link the extracted RAM image in as this machine's read-only restore input.
 ///
 /// `sync_pending` says the extraction is still writing that image back in the
@@ -463,7 +478,7 @@ pub(crate) fn prepare_memory_backend(snapshot: &Path, branchable: bool) -> Resul
     }
     #[cfg(target_os = "linux")]
     {
-        if branchable && readonly_restore_supported() {
+        if (branchable || libkrun_reads_restore_memory()) && readonly_restore_supported() {
             return Ok(());
         }
         let vm_dir = snapshot
