@@ -283,6 +283,10 @@ impl EmbeddedRuntime {
                     } else if status.trim() != "OK running" {
                         return Err(Error::agent("recover interrupted pause", status));
                     }
+                    crate::portable_checkpoint::release_interrupted_capture(
+                        name,
+                        record.paused_checkpoint.as_deref(),
+                    );
                     record = self
                         .db
                         .update_vm_durable(name, |r| {
@@ -486,6 +490,10 @@ impl EmbeddedRuntime {
                     } else if status.trim() != "OK running" {
                         return Err(Error::agent("resume interrupted pause", status));
                     }
+                    crate::portable_checkpoint::release_interrupted_capture(
+                        name,
+                        record.paused_checkpoint.as_deref(),
+                    );
                     self.db.finish_saved_execution(name, |record| {
                         record.paused_checkpoint = None;
                         record.state = RecordState::Running;

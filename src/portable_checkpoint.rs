@@ -1980,9 +1980,64 @@ fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tem
     runtime_capture_dir(name, vm)
 }
 
+/// Name prefix of a capture's runtime directory in the machine's data directory.
+const RUNTIME_CAPTURE_PREFIX: &str = "checkpoint-capture-";
+
+/// Release what a capture left when its process died before it finished:
+/// the saves it prepared in the VMM, their runtime directories, and the
+/// pause's `output` if it got that far. A VMM holds one prepared save until it
+/// is finished or cancelled, and refuses to prepare another before then, so
+/// without this the machine could never be paused again. The caller holds the
+/// machine's source lock, so no live capture owns any of these.
+pub(crate) fn release_interrupted_capture(name: &str, output: Option<&Path>) {
+    release_interrupted_capture_in(
+        &crate::agent::vm_data_dir(name),
+        &crate::agent::fork::control_socket_path(name),
+        output,
+    );
+}
+
+fn release_interrupted_capture_in(data: &Path, control: &Path, output: Option<&Path>) {
+    let remove = |path: &Path| {
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "could not remove an interrupted capture's files")
+            }
+        }
+    };
+    for entry in std::fs::read_dir(data).into_iter().flatten().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(RUNTIME_CAPTURE_PREFIX)
+        {
+            continue;
+        }
+        let snapshot = entry.path().join(ASSET_DIR);
+        match crate::agent::fork::control_socket_cmd(
+            control,
+            &format!("CANCEL_SAVE {}", snapshot.display()),
+        ) {
+            Ok(reply) => tracing::info!(reply = reply.trim(), "released an interrupted save"),
+            Err(error) => tracing::warn!(%error, "could not release an interrupted save"),
+        }
+        remove(&entry.path());
+    }
+    if let Some(output) = output {
+        remove(output);
+    }
+}
+
 fn runtime_capture_dir_at(data: &Path, ids: Option<(u32, u32)>) -> Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix("checkpoint-capture-");
+    builder.prefix(RUNTIME_CAPTURE_PREFIX);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2433,6 +2488,8 @@ mod pause_tests {
                 let command = line.trim().to_string();
                 if command == "STATUS" || command == "RESUME" {
                     stream.write_all(b"OK running\n").unwrap();
+                } else if command.starts_with("CANCEL_SAVE ") {
+                    stream.write_all(b"OK canceled\n").unwrap();
                 } else {
                     held.push(stream);
                 }
@@ -2515,6 +2572,28 @@ mod pause_tests {
             [PauseStage::Saving, PauseStage::Durable]
         );
         PauseControl::new().observe(PauseStage::Saving);
+    }
+
+    #[test]
+    fn an_interrupted_capture_is_released_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, commands) = fake_vmm(dir.path());
+        let data = dir.path().join("vm");
+        let capture = data.join(format!("{RUNTIME_CAPTURE_PREFIX}abc"));
+        std::fs::create_dir_all(capture.join(ASSET_DIR)).unwrap();
+        std::fs::create_dir_all(data.join("storage")).unwrap();
+        let output = data.join("pause-1.local.smolcheckpoint");
+        std::fs::create_dir_all(&output).unwrap();
+
+        release_interrupted_capture_in(&data, &socket, Some(&output));
+
+        assert_eq!(
+            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+            format!("CANCEL_SAVE {}", capture.join(ASSET_DIR).display())
+        );
+        assert!(!capture.exists());
+        assert!(!output.exists());
+        assert!(data.join("storage").exists());
     }
 
     #[test]
