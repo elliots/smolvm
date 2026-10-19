@@ -99,6 +99,8 @@ mod nsfile;
 mod oci;
 mod paths;
 mod pod;
+#[cfg(target_os = "linux")]
+mod pod_session;
 mod port_forward;
 mod process;
 #[cfg(unix)]
@@ -2310,10 +2312,17 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
-        // PodStart streams the pod container's (or exec process's) I/O on
-        // this connection — Started → Stdout/Stderr → Exited, with Stdin and
-        // Resize handled by the interactive pumps — like interactive Run.
-        if let AgentRequest::PodStart { .. } = &request {
+        // PodStart and PodAttach stream a pod process's output on this
+        // connection: Started, Stdout and Stderr, then Exited. On Linux the
+        // process runs in a session that outlives the connection, and input
+        // from the host ends the stream (see pod_session).
+        if matches!(
+            &request,
+            AgentRequest::PodStart { .. } | AgentRequest::PodAttach { .. }
+        ) {
+            #[cfg(target_os = "linux")]
+            pod_session::handle(stream, request)?;
+            #[cfg(not(target_os = "linux"))]
             pod::handle_pod_start(stream, request)?;
             continue;
         }
@@ -2853,8 +2862,8 @@ fn handle_request(
             tty,
         } => pod::handle_pod_create(&id, &rootfs_rel, &spec_json, tty),
 
-        // PodStart streams on the connection; routed in handle_connection.
-        AgentRequest::PodStart { .. } => AgentResponse::error(
+        // PodStart and PodAttach stream on the connection; routed in handle_connection.
+        AgentRequest::PodStart { .. } | AgentRequest::PodAttach { .. } => AgentResponse::error(
             "pod start must be handled at connection level",
             error_codes::INTERNAL_ERROR,
         ),

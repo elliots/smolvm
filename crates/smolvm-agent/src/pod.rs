@@ -1,10 +1,12 @@
 //! Kubernetes pod-container support (containerd shim v2 datapath).
 //!
 //! The host-side shim (`containerd-shim-smolvm-v2`) drives ordinary OCI
-//! containers inside the sandbox VM through six requests: `PodCreate`
-//! (validate + stash), `PodStart` (run with streaming I/O on the request
-//! connection), `PodExec` (stash an exec process), `PodSignal`, `PodPids`
-//! and `PodDelete`. See `docs/kubernetes-runtime.md` for the architecture.
+//! containers inside the sandbox VM through seven requests: `PodCreate`
+//! (validate + stash), `PodStart` (run the process in a session that outlives
+//! the request connection, see `pod_session`), `PodAttach` (stream a
+//! session's output again from a cursor), `PodExec` (stash an exec process),
+//! `PodSignal`, `PodPids` and `PodDelete`. See `docs/kubernetes-runtime.md`
+//! for the architecture.
 //!
 //! Unlike the existing `Run` path, the container's rootfs is NOT an image the
 //! agent pulled itself: containerd unpacks the snapshotter mount on the host
@@ -444,6 +446,9 @@ pub fn handle_pod_create(id: &str, rootfs_rel: &str, spec_json: &str, tty: bool)
     if let Err(e) = validate_id(id) {
         return AgentResponse::error(e, error_codes::INVALID_REQUEST);
     }
+    if tty {
+        return AgentResponse::error("pod processes have no TTY", error_codes::INVALID_REQUEST);
+    }
     let rootfs = match resolve_pod_rootfs(rootfs_rel) {
         Ok(p) => p,
         Err(e) => return AgentResponse::error(e, error_codes::INVALID_REQUEST),
@@ -512,6 +517,9 @@ pub fn handle_pod_create(id: &str, rootfs_rel: &str, spec_json: &str, tty: bool)
 /// `PodExec`: stash an exec process spec for a known container. Started later
 /// by `PodStart { exec_id }`.
 pub fn handle_pod_exec(id: &str, exec_id: &str, process_json: &str, tty: bool) -> AgentResponse {
+    if tty {
+        return AgentResponse::error("pod processes have no TTY", error_codes::INVALID_REQUEST);
+    }
     if let Err(e) = validate_id(exec_id) {
         return AgentResponse::error(e, error_codes::INVALID_REQUEST);
     }
@@ -795,6 +803,8 @@ fn remove_pod_overlay(root: &Path, id: &str) -> std::io::Result<()> {
 /// (crun delete --force best-effort + bundle dir removal + registry entry).
 /// Idempotent: deleting something unknown is Ok.
 pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
+    #[cfg(target_os = "linux")]
+    crate::pod_session::remove(id, exec_id);
     if let Some(exec) = exec_id {
         if let Some(pod) = lock_registry().get_mut(id) {
             pod.execs.remove(exec);
@@ -839,9 +849,9 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
 // ============================================================================
 
 /// `PodStart`: launch the container's init process (or a registered exec
-/// process) and stream its I/O on THIS connection, exactly like interactive
-/// `Run`: `Started` → `Stdout`/`Stderr`... → `Exited`, with `Stdin`/`Resize`
-/// requests handled by the reused I/O pumps.
+/// process) and stream its output on `stream`: `Started` →
+/// `Stdout`/`Stderr`... → `Exited`. On Linux `stream` is the session's socket
+/// pair (see `pod_session`).
 #[cfg(target_os = "linux")]
 pub fn handle_pod_start(
     stream: &mut impl crate::ReadWrite,
@@ -1494,9 +1504,8 @@ fn start_init_process(
 
     crate::send_response(stream, &AgentResponse::Started)?;
 
-    // Reuse Run's streaming pumps verbatim (Stdout/Stderr frames out;
-    // Stdin/Resize requests in). No timeout: pod containers run until they
-    // exit or are signalled.
+    // Reuse Run's streaming pumps verbatim (Stdout/Stderr frames out). No
+    // timeout: pod containers run until they exit or are signalled.
     let loop_result = match pty_master {
         Some(pty) => crate::run_interactive_loop_pty(stream, &mut child, pty, None),
         None => crate::run_interactive_loop(stream, &mut child, None),

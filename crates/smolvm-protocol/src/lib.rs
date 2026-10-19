@@ -1105,21 +1105,36 @@ pub enum AgentRequest {
         /// process/env/cwd/user/mounts/resources and grafts them onto its own
         /// guest bundle template; host-specific namespaces/paths are ignored.
         spec_json: String,
-        /// Allocate a PTY for the init process.
+        /// Must be false: a pod process has no TTY.
         #[serde(default)]
         tty: bool,
     },
 
     /// Start a pod container created by `PodCreate` (or an exec process
-    /// registered by `PodExec`), streaming its I/O on THIS connection:
-    /// `Started` → `Stdout`/`Stderr`... → `Exited`. Stdin arrives via `Stdin`
-    /// requests; PTY resize via `Resize`.
+    /// registered by `PodExec`), streaming its output on THIS connection:
+    /// `Started` → `Stdout`/`Stderr`... → `Exited`. The process outlives the
+    /// connection, and `PodAttach` streams its output again. A pod process
+    /// takes no input from the host: input on the connection ends the stream.
     PodStart {
         /// Container ID.
         id: String,
         /// Exec process to start instead of the init process.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_id: Option<String>,
+    },
+
+    /// Reattach to a supervised pod process without restarting it. The cursor
+    /// counts Started/Stdout/Stderr/Exited frames already consumed by the client.
+    /// The agent keeps a bounded journal of each process's frames. A cursor
+    /// older than the journal, on attach or because the client fell behind,
+    /// gets [`AgentResponse::cursor_expired`] naming the oldest one it holds.
+    PodAttach {
+        /// Container identifier.
+        id: String,
+        /// Exec identifier, or the container init when absent.
+        exec_id: Option<String>,
+        /// Number of stream frames already consumed.
+        cursor: u64,
     },
 
     /// Register an exec process for a running pod container. Started later by
@@ -1131,7 +1146,7 @@ pub enum AgentRequest {
         exec_id: String,
         /// OCI Process JSON (containerd's ExecProcessRequest spec).
         process_json: String,
-        /// Allocate a PTY for the exec process.
+        /// Must be false: a pod process has no TTY.
         #[serde(default)]
         tty: bool,
     },
@@ -1259,6 +1274,11 @@ impl AgentRequest {
                 Some(e) => format!("PodStart {{ id: {id}, exec: {e} }}"),
                 None => format!("PodStart {{ id: {id} }}"),
             },
+            AgentRequest::PodAttach {
+                id,
+                exec_id,
+                cursor,
+            } => format!("PodAttach {{ id: {id}, exec: {exec_id:?}, cursor: {cursor} }}"),
             AgentRequest::PodExec { id, exec_id, .. } => {
                 format!("PodExec {{ id: {id}, exec: {exec_id} }}")
             }
@@ -1473,9 +1493,42 @@ pub mod error_codes {
     pub const MESSAGE_TOO_LARGE: &str = "MESSAGE_TOO_LARGE";
     /// Process wait operation failed.
     pub const WAIT_FAILED: &str = "WAIT_FAILED";
+    /// A pod replay cursor is older than the frames the agent still holds.
+    /// See [`super::AgentResponse::cursor_expired`].
+    pub const CURSOR_EXPIRED: &str = "CURSOR_EXPIRED";
 }
 
+/// Precedes the oldest retained cursor in a [`error_codes::CURSOR_EXPIRED`]
+/// message.
+const OLDEST_RETAINED_CURSOR: &str = "oldest retained cursor ";
+
 impl AgentResponse {
+    /// A pod output stream's answer to a cursor that is older than its
+    /// journal: the frames before `oldest` were dropped. A client that
+    /// accepts the gap attaches again at `oldest`.
+    pub fn cursor_expired(cursor: u64, oldest: u64) -> Self {
+        Self::error(
+            format!(
+                "pod replay cursor {cursor} outside retained journal; \
+                 {OLDEST_RETAINED_CURSOR}{oldest}"
+            ),
+            error_codes::CURSOR_EXPIRED,
+        )
+    }
+
+    /// The oldest cursor a [`Self::cursor_expired`] answer names.
+    pub fn expired_cursor_oldest(&self) -> Option<u64> {
+        match self {
+            AgentResponse::Error { message, code }
+                if code.as_deref() == Some(error_codes::CURSOR_EXPIRED) =>
+            {
+                let (_, oldest) = message.rsplit_once(OLDEST_RETAINED_CURSOR)?;
+                oldest.parse().ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Create an error response with the given message and code.
     ///
     /// # Example
@@ -2137,6 +2190,26 @@ mod tests {
             AgentRequest::PrepareFileAccess { image, workload_id }
                 if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
         ));
+    }
+
+    #[test]
+    fn an_expired_cursor_names_the_oldest_retained_one() {
+        let expired = AgentResponse::cursor_expired(3, 120);
+        let wire: AgentResponse =
+            serde_json::from_str(&serde_json::to_string(&expired).unwrap()).unwrap();
+        assert_eq!(wire.expired_cursor_oldest(), Some(120));
+        assert!(matches!(
+            &wire,
+            AgentResponse::Error { message, code: Some(code) }
+                if code == error_codes::CURSOR_EXPIRED
+                    && message.starts_with("pod replay cursor 3 outside retained journal")
+        ));
+        let other = AgentResponse::error(
+            "pod replay cursor outside retained journal; oldest retained cursor 9",
+            error_codes::INVALID_REQUEST,
+        );
+        assert_eq!(other.expired_cursor_oldest(), None);
+        assert_eq!(AgentResponse::Started.expired_cursor_oldest(), None);
     }
 
     #[test]
