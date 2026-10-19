@@ -1825,6 +1825,36 @@ impl Drop for SavedVmPause {
     }
 }
 
+/// Hold what a save at `snapshot` needs, its directory, source lock and
+/// memory reservation, until the VMM has finished writing it. A cancelled
+/// pause stops waiting for FINISH_SAVE, but the VMM's save runs on to its
+/// end, a RAM image's worth of writes later. Until then a new capture of the
+/// same machine waits for the source lock.
+fn release_after_save(control: &Path, snapshot: &Path, held: impl Send + 'static) {
+    let control = control.to_path_buf();
+    let status = format!("SAVE_STATUS {}", snapshot.display());
+    let wait = move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(30 * 60)
+            && crate::agent::fork::control_socket_cmd(&control, &status)
+                .is_ok_and(|reply| reply.trim() == "OK finishing")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(held);
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "the VMM ended a cancelled save"
+        );
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("cancelled-save".into())
+        .spawn(wait)
+    {
+        tracing::warn!(%error, "released a cancelled save while the VMM may still write it");
+    }
+}
+
 fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
     let root = options
         .staging_dir
@@ -2098,6 +2128,7 @@ pub(crate) fn capture_to_path_with_source_release(
         |_| Ok(()),
         None,
         crate::checkpoint_store::WriteOptions::default(),
+        None,
     )
 }
 
@@ -2156,6 +2187,7 @@ pub(crate) fn capture_to_path_deferring_retention(
         |_| Ok(()),
         Some(&mut deferred),
         crate::checkpoint_store::WriteOptions::default(),
+        None,
     )?;
     Ok((result, deferred))
 }
@@ -2185,6 +2217,7 @@ pub(crate) fn capture_to_store(
             trust_existing_objects: true,
             defer_object_sync: true,
         },
+        None,
     )
 }
 
@@ -2194,6 +2227,316 @@ pub enum PauseCaptureStage {
     Capturing,
     /// Persist the resume point before terminating the frozen VM.
     Durable,
+}
+
+/// Lets another thread cancel a pause until its checkpoint is durable, and
+/// reports the pause's stages.
+///
+/// A cancel before the pause freezes the guest keeps it from freezing. A
+/// cancel while the guest is frozen resumes it at once, in the same VM
+/// process, and the pause then discards what it saved. Once the pause commits
+/// its checkpoint, a cancel has no effect. Use one control per pause; clones
+/// share it.
+#[derive(Clone, Default)]
+pub struct PauseControl {
+    state: std::sync::Arc<std::sync::Mutex<PauseControlState>>,
+    observer: Option<std::sync::Arc<dyn Fn(PauseStage) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for PauseControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PauseControl")
+            .field("state", &self.state)
+            .field("observer", &self.observer.is_some())
+            .finish()
+    }
+}
+
+/// A stage of a pause, reported to its [`PauseControl`]'s observer on the
+/// pause's thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseStage {
+    /// The guest is frozen and the machine's record says Pausing.
+    Saving,
+    /// The checkpoint is durable and the record says Paused. The VM process
+    /// has not exited yet.
+    Durable,
+}
+
+#[derive(Debug, Default)]
+struct PauseControlState {
+    cancelled: bool,
+    committed: bool,
+    /// The VMM's control socket while the guest may be frozen.
+    frozen: Option<PathBuf>,
+    /// A wait on the VMM that a cancel cuts short.
+    waiting: Option<crate::platform::uds::UdsStream>,
+}
+
+impl PauseControl {
+    /// A control that has not been cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A control that calls `observer` at each [`PauseStage`] the pause
+    /// reaches. A cancelled pause may reach neither.
+    pub fn with_observer(observer: impl Fn(PauseStage) + Send + Sync + 'static) -> Self {
+        Self {
+            observer: Some(std::sync::Arc::new(observer)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn observe(&self, stage: PauseStage) {
+        if let Some(observer) = &self.observer {
+            observer(stage);
+        }
+    }
+
+    /// Cancel the pause unless its checkpoint is durable. A frozen guest is
+    /// resumed before this returns, which takes one VMM control command.
+    /// Returns false when the pause has committed its checkpoint, so it runs
+    /// to its end. Idempotent.
+    pub fn cancel(&self) -> bool {
+        let mut state = self.lock();
+        if state.committed {
+            return false;
+        }
+        state.cancelled = true;
+        // The pause's own thread may be busy for a while yet, hashing the RAM
+        // image for example, so the guest is resumed here.
+        if let Some(control) = &state.frozen {
+            let timeout = std::time::Duration::from_secs(10);
+            match crate::agent::fork::control_socket_cmd_with_timeout(control, "RESUME", timeout) {
+                Ok(reply) if reply.starts_with("OK") => {}
+                Ok(reply) => tracing::warn!(%reply, "could not resume a cancelled pause"),
+                Err(error) => tracing::warn!(%error, "could not resume a cancelled pause"),
+            }
+        }
+        if let Some(waiting) = state.waiting.take() {
+            let _ = waiting.shutdown(std::net::Shutdown::Both);
+        }
+        true
+    }
+
+    /// Whether [`Self::cancel`] took effect.
+    pub fn is_cancelled(&self) -> bool {
+        self.lock().cancelled
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(pause_cancelled());
+        }
+        Ok(())
+    }
+
+    /// From now until the guard drops, a cancel resumes the guest.
+    fn freezing(&self, control: &Path) -> Result<PauseFreeze<'_>> {
+        let mut state = self.lock();
+        if state.cancelled {
+            return Err(pause_cancelled());
+        }
+        state.frozen = Some(control.to_path_buf());
+        Ok(PauseFreeze(self))
+    }
+
+    /// The point after which a cancel has no effect.
+    fn commit(&self) -> Result<()> {
+        let mut state = self.lock();
+        if state.cancelled {
+            return Err(pause_cancelled());
+        }
+        state.committed = true;
+        state.frozen = None;
+        Ok(())
+    }
+
+    /// [`crate::agent::fork::control_socket_cmd_with_timeout`], whose wait
+    /// for the reply a cancel cuts short.
+    fn command(
+        &self,
+        control: &Path,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String> {
+        self.check()?;
+        #[cfg(unix)]
+        {
+            let mut stream = crate::platform::uds::UdsStream::connect(control)
+                .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
+            stream.set_read_timeout(Some(timeout)).ok();
+            {
+                let mut state = self.lock();
+                if state.cancelled {
+                    return Err(pause_cancelled());
+                }
+                state.waiting = Some(stream.try_clone()?);
+            }
+            let reply = (|| -> std::io::Result<String> {
+                stream.write_all(format!("{command}\n").as_bytes())?;
+                let mut reply = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
+                    reply.push(byte[0]);
+                }
+                Ok(String::from_utf8_lossy(&reply).into_owned())
+            })();
+            self.lock().waiting = None;
+            self.check()?;
+            reply.map_err(|e| Error::agent("control socket", e.to_string()))
+        }
+        #[cfg(not(unix))]
+        crate::agent::fork::control_socket_cmd_with_timeout(control, command, timeout)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PauseControlState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct PauseFreeze<'a>(&'a PauseControl);
+
+impl Drop for PauseFreeze<'_> {
+    fn drop(&mut self) {
+        self.0.lock().frozen = None;
+    }
+}
+
+fn pause_cancelled() -> Error {
+    Error::agent("pause machine", "the pause was cancelled")
+}
+
+#[cfg(all(test, unix))]
+mod pause_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::time::Duration;
+
+    /// A VMM control socket that reports each command it reads. It answers
+    /// STATUS and RESUME, and holds every other connection open unanswered.
+    fn fake_vmm(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<String>) {
+        let path = dir.join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (commands, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                let command = line.trim().to_string();
+                if command == "STATUS" || command == "RESUME" {
+                    stream.write_all(b"OK running\n").unwrap();
+                } else {
+                    held.push(stream);
+                }
+                if commands.send(command).is_err() {
+                    return;
+                }
+            }
+        });
+        (path, received)
+    }
+
+    #[test]
+    fn a_cancel_before_the_freeze_keeps_the_pause_from_freezing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, commands) = fake_vmm(dir.path());
+        let control = PauseControl::new();
+        assert!(control.cancel());
+        assert!(control.cancel(), "a cancel is idempotent");
+        assert!(control.is_cancelled());
+        assert!(control.check().is_err());
+        assert!(control.freezing(&socket).is_err());
+        assert!(control
+            .command(&socket, "STATUS", Duration::from_secs(5))
+            .is_err());
+        assert!(control.commit().is_err());
+        assert!(commands.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn a_cancel_while_frozen_resumes_the_guest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, commands) = fake_vmm(dir.path());
+        let control = PauseControl::new();
+        let freeze = control.freezing(&socket).unwrap();
+        assert!(control.clone().cancel());
+        assert_eq!(
+            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "RESUME"
+        );
+        drop(freeze);
+        assert!(control.commit().is_err());
+        // Once the pause has unwound, a late cancel leaves the VMM alone.
+        assert!(control.cancel());
+        assert!(commands.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn a_cancel_after_the_commit_has_no_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, commands) = fake_vmm(dir.path());
+        let control = PauseControl::new();
+        let _freeze = control.freezing(&socket).unwrap();
+        assert_eq!(
+            control
+                .command(&socket, "STATUS", Duration::from_secs(5))
+                .unwrap(),
+            "OK running"
+        );
+        assert_eq!(
+            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "STATUS"
+        );
+        control.commit().unwrap();
+        assert!(!control.cancel());
+        assert!(!control.is_cancelled());
+        assert!(commands.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn an_observer_sees_each_stage_and_clones_share_it() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let control = PauseControl::with_observer({
+            let seen = seen.clone();
+            move |stage| seen.lock().unwrap().push(stage)
+        });
+        control.clone().observe(PauseStage::Saving);
+        control.observe(PauseStage::Durable);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [PauseStage::Saving, PauseStage::Durable]
+        );
+        PauseControl::new().observe(PauseStage::Saving);
+    }
+
+    #[test]
+    fn a_cancel_cuts_a_wait_on_the_vmm_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, commands) = fake_vmm(dir.path());
+        let control = PauseControl::new();
+        let waiter = std::thread::spawn({
+            let control = control.clone();
+            move || control.command(&socket, "FINISH_SAVE /run/save", Duration::from_secs(60))
+        });
+        assert_eq!(
+            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "FINISH_SAVE /run/save"
+        );
+        let cancelled = std::time::Instant::now();
+        assert!(control.cancel());
+        assert!(waiter.join().unwrap().is_err());
+        assert!(cancelled.elapsed() < Duration::from_secs(5));
+        // The guest was not frozen, so nothing was resumed.
+        assert!(commands.recv_timeout(Duration::from_millis(200)).is_err());
+    }
 }
 
 /// Capture one final execution boundary and stop without running the guest again.
@@ -2215,6 +2558,30 @@ pub fn capture_and_stop_to_path(
         publish_resume_point,
         None,
         crate::checkpoint_store::WriteOptions::default(),
+        None,
+    )
+}
+
+/// [`capture_and_stop_to_path`] that `control` can cancel until the
+/// checkpoint is durable. A cancelled capture fails, with the guest running.
+pub fn capture_and_stop_to_path_with(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    control: &PauseControl,
+    publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+) -> Result<CaptureResult> {
+    capture_with_completion(
+        name,
+        output,
+        options,
+        DEFAULT_HISTORY,
+        || {},
+        true,
+        publish_resume_point,
+        None,
+        crate::checkpoint_store::WriteOptions::default(),
+        Some(control),
     )
 }
 
@@ -2229,7 +2596,10 @@ fn capture_with_completion(
     mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
     defer_retain: Option<&mut Option<DeferredRetain>>,
     writer_options: crate::checkpoint_store::WriteOptions,
+    cancel: Option<&PauseControl>,
 ) -> Result<CaptureResult> {
+    let check_cancel = || cancel.map_or(Ok(()), PauseControl::check);
+    check_cancel()?;
     let started = std::time::Instant::now();
     let mut phase = started;
     if options.store_dir.is_some() && options.staging_dir.is_some() {
@@ -2458,8 +2828,10 @@ fn capture_with_completion(
     if !frozen {
         crate::agent::fork::sync_fork_source(name)?;
         log_phase(name, "capture_sync", &mut phase);
+        check_cancel()?;
         release_free_guest_memory(name, &control);
         log_phase(name, "capture_free_memory_hint", &mut phase);
+        check_cancel()?;
     }
     if stop_after_capture {
         remove_paused_disks_marker(&crate::agent::vm_data_dir(name))?;
@@ -2520,6 +2892,7 @@ fn capture_with_completion(
         }
         Ok(reply)
     };
+    let _freeze = cancel.map(|cancel| cancel.freezing(&control)).transpose()?;
     let mut reply = if command == "SAVE" {
         synchronous_save()?
     } else {
@@ -2544,6 +2917,7 @@ fn capture_with_completion(
     // A packed machine whose held save failed goes back to SAVE, never to the
     // rebasing PREPARE_SAVE.
     if !frozen && !prepared && (held_in_place || declined_deferred_save(&reply)) {
+        check_cancel()?;
         reply = synchronous_save()?;
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
@@ -2559,6 +2933,10 @@ fn capture_with_completion(
         // Resuming a frozen source would write RAM its branches still map.
         armed: !frozen,
     };
+    check_cancel()?;
+    if let (Some(cancel), true) = (cancel, stop_after_capture) {
+        cancel.observe(PauseStage::Saving);
+    }
     #[cfg(target_os = "linux")]
     if prepared {
         memory_reservation.as_mut().unwrap().checkpoint_prepared()?;
@@ -2598,6 +2976,7 @@ fn capture_with_completion(
     if !stop_after_capture {
         pause.resume()?;
     }
+    check_cancel()?;
     log_phase(
         name,
         if stop_after_capture {
@@ -2700,11 +3079,29 @@ fn capture_with_completion(
         }
     } else {
         if prepared && streamed_memory.is_none() {
-            let reply = crate::agent::fork::control_socket_cmd_with_timeout(
-                &pause.control,
-                &format!("FINISH_SAVE {}", runtime_snapshot.display()),
-                std::time::Duration::from_secs(30 * 60),
-            )?;
+            let finish = format!("FINISH_SAVE {}", runtime_snapshot.display());
+            let timeout = std::time::Duration::from_secs(30 * 60);
+            let reply = match cancel {
+                Some(cancel) => cancel.command(&pause.control, &finish, timeout),
+                None => crate::agent::fork::control_socket_cmd_with_timeout(
+                    &pause.control,
+                    &finish,
+                    timeout,
+                ),
+            };
+            if cancel.is_some_and(PauseControl::is_cancelled) {
+                #[cfg(target_os = "linux")]
+                let held = (
+                    runtime_capture,
+                    memory_reservation.take(),
+                    source_lock.take(),
+                );
+                #[cfg(not(target_os = "linux"))]
+                let held = (runtime_capture, source_lock.take());
+                release_after_save(&pause.control, &runtime_snapshot, held);
+                return Err(pause_cancelled());
+            }
+            let reply = reply?;
             tracing::info!(machine = name, command = "FINISH_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
             if !reply.starts_with("OK") {
                 return Err(Error::agent("finish checkpoint", reply));
@@ -2899,16 +3296,19 @@ fn capture_with_completion(
     // files, as a store needs them, so a resume can install them.
     #[cfg(unix)]
     if options.local {
+        check_cancel()?;
         if let Some(deferred) = deferred_backings {
             deferred.stage_copies()?;
         }
         seal_local_checkpoint(&staging_dir, &manifest)?;
+        check_cancel()?;
         std::fs::rename(&staging_dir, output)
             .map_err(|e| Error::agent("publish local checkpoint", e.to_string()))?;
         if let Some(parent) = output.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
         log_phase(name, "capture_local", &mut phase);
+        cancel.map_or(Ok(()), PauseControl::commit)?;
         if let Some(pins) = &pins {
             pins.commit(output)?;
         }
@@ -3005,6 +3405,7 @@ fn capture_with_completion(
             }
         }
         if stop_after_capture {
+            cancel.map_or(Ok(()), PauseControl::commit)?;
             publish_resume_point(PauseCaptureStage::Durable)?;
             pause.stop(name, vm)?;
             record_paused_disks(
@@ -3109,6 +3510,7 @@ fn capture_with_completion(
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
     if stop_after_capture {
+        cancel.map_or(Ok(()), PauseControl::commit)?;
         #[cfg(unix)]
         if let Some(pins) = &pins {
             pins.commit(output)?;

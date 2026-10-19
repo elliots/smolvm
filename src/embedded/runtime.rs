@@ -11,6 +11,7 @@ use crate::db::SmolvmDb;
 use crate::embedded::control::{self, MachineSpec};
 use crate::embedded::exec::{ExecCancel, ExecOptions};
 use crate::embedded::handle::VmHandle;
+use crate::portable_checkpoint::{PauseControl, PauseStage};
 use crate::{Error, Result};
 use smolvm_protocol::ImageInfo;
 
@@ -64,6 +65,17 @@ impl ResizeSpec {
         }
         Ok(())
     }
+}
+
+/// How [`EmbeddedRuntime::pause_machine_local_with`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseOutcome {
+    /// The checkpoint is durable and the VM process has exited.
+    Paused,
+    /// The pause was cancelled before its checkpoint was durable. The VM
+    /// process that ran the machine still runs it, and the machine has no
+    /// checkpoint.
+    Cancelled,
 }
 
 /// How [`EmbeddedRuntime::stop_machine_with`] and
@@ -199,7 +211,7 @@ impl EmbeddedRuntime {
 
     /// Save execution durably and stop at that exact boundary.
     pub fn pause_machine(&self, name: &str) -> Result<()> {
-        self.pause_machine_inner(name, None, false)
+        self.pause_machine_inner(name, None, false, None).map(drop)
     }
 
     /// [`Self::pause_machine`], keeping the saved execution as a local
@@ -207,7 +219,21 @@ impl EmbeddedRuntime {
     /// it starts from without extracting or verifying an archive. Such a pause
     /// cannot be exported.
     pub fn pause_machine_local(&self, name: &str) -> Result<()> {
-        self.pause_machine_inner(name, None, true)
+        self.pause_machine_inner(name, None, true, None).map(drop)
+    }
+
+    /// [`Self::pause_machine_local`] that another thread can cancel with
+    /// `control` until the checkpoint is durable. A cancelled pause resumes
+    /// the guest in its running VM process, discards what it saved, and
+    /// returns [`PauseOutcome::Cancelled`]. If the cancel came while the VMM
+    /// wrote guest RAM, the VMM goes on writing it for a while, and the next
+    /// pause of the machine waits until it has finished.
+    pub fn pause_machine_local_with(
+        &self,
+        name: &str,
+        control: &PauseControl,
+    ) -> Result<PauseOutcome> {
+        self.pause_machine_inner(name, None, true, Some(control))
     }
 
     /// Retry a durable pause without ever pausing a later resumed execution.
@@ -223,10 +249,17 @@ impl EmbeddedRuntime {
                 "invalid pause operation identifier",
             ));
         }
-        self.pause_machine_inner(name, Some(operation), false)
+        self.pause_machine_inner(name, Some(operation), false, None)
+            .map(drop)
     }
 
-    fn pause_machine_inner(&self, name: &str, operation: Option<&str>, local: bool) -> Result<()> {
+    fn pause_machine_inner(
+        &self,
+        name: &str,
+        operation: Option<&str>,
+        local: bool,
+        cancel: Option<&PauseControl>,
+    ) -> Result<PauseOutcome> {
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let mut record = control::get_record(&self.db, name)?;
@@ -288,7 +321,7 @@ impl EmbeddedRuntime {
                     Error::agent("pause machine", "paused machine has no checkpoint")
                 })?;
                 crate::portable_checkpoint::verify_resume_point(path)?;
-                return Ok(());
+                return Ok(PauseOutcome::Paused);
             }
             if record.paused_checkpoint.is_some() {
                 return Err(Error::agent_conflict(
@@ -307,27 +340,41 @@ impl EmbeddedRuntime {
                 local,
                 ..Default::default()
             };
-            let result = crate::portable_checkpoint::capture_and_stop_to_path(
-                name,
-                &output,
-                &pause_options,
-                |stage| {
-                    self.db
-                        .update_vm_durable(name, |record| {
-                            record.paused_checkpoint = Some(output.clone());
-                            record.state = match stage {
-                                crate::portable_checkpoint::PauseCaptureStage::Capturing => {
-                                    RecordState::Pausing
-                                }
-                                crate::portable_checkpoint::PauseCaptureStage::Durable => {
-                                    RecordState::Paused
-                                }
-                            };
-                        })?
-                        .ok_or_else(|| Error::vm_not_found(name))?;
-                    Ok(())
-                },
-            );
+            let publish = |stage| {
+                let durable = matches!(
+                    stage,
+                    crate::portable_checkpoint::PauseCaptureStage::Durable
+                );
+                self.db
+                    .update_vm_durable(name, |record| {
+                        record.paused_checkpoint = Some(output.clone());
+                        record.state = if durable {
+                            RecordState::Paused
+                        } else {
+                            RecordState::Pausing
+                        };
+                    })?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+                if let (Some(control), true) = (cancel, durable) {
+                    control.observe(PauseStage::Durable);
+                }
+                Ok(())
+            };
+            let result = match cancel {
+                Some(control) => crate::portable_checkpoint::capture_and_stop_to_path_with(
+                    name,
+                    &output,
+                    &pause_options,
+                    control,
+                    publish,
+                ),
+                None => crate::portable_checkpoint::capture_and_stop_to_path(
+                    name,
+                    &output,
+                    &pause_options,
+                    publish,
+                ),
+            };
             if let Err(error) = result {
                 // Capture's guard has resumed the original on failure. Never
                 // erase the durable recovery point if the process is gone.
@@ -355,6 +402,10 @@ impl EmbeddedRuntime {
                         }
                     }
                 }
+                if running && cancel.is_some_and(PauseControl::is_cancelled) {
+                    tracing::info!(machine = name, "pause cancelled; the machine runs on");
+                    return Ok(PauseOutcome::Cancelled);
+                }
                 return Err(error);
             }
             self.remove_cached_handle(name)?;
@@ -363,7 +414,7 @@ impl EmbeddedRuntime {
                 record.pid = None;
                 record.pid_start_time = None;
             })?;
-            Ok(())
+            Ok(PauseOutcome::Paused)
         })
     }
 
