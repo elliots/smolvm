@@ -805,9 +805,9 @@ impl PodBackend for EnginePodBackend {
 
             // Copy the CRI bind mounts (volumes + generated /etc/resolv.conf,
             // /etc/hosts, /etc/hostname, etc.) into the pod share and rewrite
-            // their sources to the guest-visible path, so the agent can
-            // materialize them into the container's writable overlay. Also inject
-            // the pod hostname (which lives on the sandbox spec, not the container).
+            // their sources to the guest-visible path, so the agent can bind
+            // them into the container. Also inject the pod hostname (which
+            // lives on the sandbox spec, not the container).
             let spec_json = materialize_bind_mounts(
                 &spec_json,
                 &sandbox.share_dir,
@@ -1089,8 +1089,8 @@ impl PodBackend for EnginePodBackend {
 }
 
 /// Copy the CRI bind mounts referenced by `config.json` into the pod share so
-/// the guest can materialize them into the container, and rewrite each such
-/// mount's `source` to the guest-visible path under [`POD_SHARE_GUEST_MOUNT`].
+/// the agent can bind them into the container, and rewrite each such mount's
+/// `source` to the guest-visible path under [`POD_SHARE_GUEST_MOUNT`].
 ///
 /// Only real host-path bind mounts are copied — volumes and the generated
 /// `/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname`, termination-log, etc. The
@@ -1201,7 +1201,9 @@ fn materialize_bind_mounts(
         // through the (uid-mapped) virtiofs share regardless of the source's
         // original owner/mode — a CRI volume created root-only (e.g. mode 0700)
         // is otherwise EACCES to the guest. Container-visible perms only widen
-        // read access on this ephemeral copy; write goes to the guest overlay.
+        // read access on this per-container copy. The agent binds a volume's
+        // copy in place, so the container's writes reach it through virtiofs,
+        // and gives the container its own copy of a generated /etc file.
         let _ = std::process::Command::new("chmod")
             .args(["-R", "a+rX"])
             .arg(&dst)

@@ -38,8 +38,11 @@ pub const POD_SHARE_TAG: &str = "podshare";
 /// Guest directory holding per-pod-container state (crun bundle dirs).
 const POD_STATE_DIR: &str = "/storage/containers/pods";
 
-/// Guest overlay and materialized mounts for each pod container.
+/// Guest overlay and copies of the generated files for each pod container.
 const POD_OVERLAY_DIR: &str = "/storage/pods";
+
+/// Container paths of the files the container runtime generates for a pod.
+const GENERATED_FILES: [&str; 3] = ["/etc/hosts", "/etc/resolv.conf", "/etc/hostname"];
 
 // ============================================================================
 // Registry
@@ -76,16 +79,17 @@ struct StashedProcess {
     additional_gids: Vec<u32>,
 }
 
-/// A CRI mount (volume, or a generated file like resolv.conf/hosts/hostname) the
-/// shim materialized into the pod share; the agent copies it into the container's
-/// writable overlay at `destination` before start. `source` is the guest path of
-/// the shim's copy under the virtiofs pod share.
+/// A CRI mount whose source the host placed under the pod's virtiofs share.
+/// The container binds that source in place, so its writes reach it, except
+/// for one of [`GENERATED_FILES`], which the container gets its own copy of.
 #[derive(Debug, Clone)]
 struct PodMount {
-    /// Guest path of the shim's copy (under `<VIRTIOFS>/podshare/<id>/mounts/N`).
+    /// Guest path of the source under the pod share, such as smolvm-shim's copy
+    /// at `<VIRTIOFS>/podshare/<id>/mounts/N`.
     source: String,
     /// Absolute container path to place it at.
     destination: String,
+    read_only: bool,
 }
 
 /// An exec process registered by `PodExec`, started by `PodStart { exec_id }`.
@@ -116,8 +120,8 @@ struct PodContainer {
     readonly_rootfs: bool,
     /// Container UTS hostname (OCI `hostname`, from the pod sandbox).
     hostname: Option<String>,
-    /// CRI mounts (volumes + generated /etc files) to materialize into the
-    /// writable overlay before start.
+    /// CRI mounts (volumes + generated /etc files) to bind into the container
+    /// at start.
     mounts: Vec<PodMount>,
     /// OCI `process.noNewPrivileges` (CRI allowPrivilegeEscalation=false). Only
     /// set by containers that request it, so this is false for most.
@@ -306,6 +310,9 @@ fn parse_pod_mounts(spec: &serde_json::Value) -> Vec<PodMount> {
                     Some(PodMount {
                         source: source.to_string(),
                         destination: destination.to_string(),
+                        read_only: m.get("options").and_then(|v| v.as_array()).is_some_and(
+                            |options| options.iter().any(|option| option.as_str() == Some("ro")),
+                        ),
                     })
                 })
                 .collect()
@@ -897,7 +904,7 @@ fn write_pod_bundle(
     pod: &PodContainer,
     id: &str,
     bundle: &Path,
-    mount_binds: &[(PathBuf, String)],
+    mount_binds: &[(PathBuf, String, bool)],
 ) -> Result<(), String> {
     let identity = crate::oci::resolve_process_identity(&pod.rootfs, pod.process.user.as_deref())?;
     // unprivileged=false: pods get the VM-grade default capability set — the
@@ -978,8 +985,8 @@ fn write_pod_bundle(
     // CRI mounts (volumes + generated /etc/resolv.conf, /etc/hosts) as bind mounts.
     // Added last so they layer on TOP of the default mounts (e.g. a volume at
     // /tmp/foo mounts over the default tmpfs at /tmp).
-    for (source, destination) in mount_binds {
-        spec.add_bind_mount(&source.to_string_lossy(), destination, false);
+    for (source, destination, read_only) in mount_binds {
+        spec.add_bind_mount(&source.to_string_lossy(), destination, *read_only);
     }
 
     // Preserve synthetic CRI mounts the shim did NOT rewrite to the pod share:
@@ -1099,73 +1106,41 @@ fn graft_security_context(cfg: &mut serde_json::Value, host: &serde_json::Value)
     }
 }
 
-/// Copy each materialized CRI mount from the (read-only) pod share into the
-/// container's writable overlay `rootfs` at its destination. `cp -aT` makes the
-/// destination a faithful copy of the source whether it is a file (resolv.conf,
-/// hosts, hostname) or a directory (a volume), preserving modes/owners/symlinks.
-/// Parent directories are created first. Reads from the read-only virtiofs share
-/// are fine — only writes to it fail — and the target lives on the writable
-/// overlay upper.
+/// The bind mounts for a container's CRI mounts: each source under the pod
+/// share at its destination, read-only when the mount says ro. One of
+/// [`GENERATED_FILES`] is first copied into `copies` on guest storage and
+/// bound from there, so the container can write it: the VMM serves the share
+/// under the machine's unprivileged uid, and the host's copies of these files
+/// belong to root.
 #[cfg(target_os = "linux")]
-fn materialize_pod_mounts(id: &str, mounts: &[PodMount]) -> Vec<(PathBuf, String)> {
-    // Copy each mount from the read-only share to a per-container writable dir on
-    // /storage, then bind it into the container. Bind mounts (added to the OCI
-    // spec) layer ON TOP of the default mounts, so a volume at /tmp/foo survives
-    // the default tmpfs at /tmp (copying into the overlay would be shadowed by it).
-    // The copy makes the volume writable + guest-local (correct emptyDir/configMap
-    // /secret semantics; smolvm's virtiofs share is read-only so a live bind of the
-    // host source couldn't be written).
-    let base = Path::new(POD_OVERLAY_DIR).join(id).join("mnt");
-    let mut binds = Vec::new();
-    for (n, m) in mounts.iter().enumerate() {
-        let dst = base.join(n.to_string());
-        if let Some(parent) = dst.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                continue;
-            }
-        }
-        // Native recursive copy (follows symlinks) rather than shelling out to
-        // `cp` — the guest's `cp` exits non-zero with no diagnostic on some
-        // virtiofs→/storage copies, and this gives precise errors and handles the
-        // symlink-volume case (dereference so the container sees the content).
-        match copy_tree(Path::new(&m.source), &dst) {
-            Ok(()) => binds.push((dst, m.destination.clone())),
-            Err(e) => warn!(
-                source = %m.source, dest = %m.destination, error = %e,
-                "failed to materialize mount (container starts without it)"
-            ),
-        }
+fn pod_mount_binds(
+    copies: &Path,
+    mounts: &[PodMount],
+) -> Result<Vec<(PathBuf, String, bool)>, String> {
+    let mut binds = Vec::with_capacity(mounts.len());
+    for (n, mount) in mounts.iter().enumerate() {
+        let source = if GENERATED_FILES.contains(&mount.destination.as_str()) {
+            std::fs::create_dir_all(copies)
+                .map_err(|e| format!("mkdir {}: {e}", copies.display()))?;
+            let copy = copies.join(n.to_string());
+            std::fs::copy(&mount.source, &copy)
+                .map_err(|e| format!("copy {} for {}: {e}", mount.source, mount.destination))?;
+            copy
+        } else {
+            PathBuf::from(&mount.source)
+        };
+        binds.push((source, mount.destination.clone(), mount.read_only));
     }
-    binds
-}
-
-/// Recursively copy `src` to `dst`, following symlinks (so a symlinked volume
-/// source yields the pointed-to content, matching the CRI's bind semantics).
-/// Regular files and directories are copied; special files (devices/fifos/
-/// sockets) are skipped. Directory permissions are preserved best-effort.
-#[cfg(target_os = "linux")]
-fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
-    // metadata() follows symlinks — a symlinked source is dereferenced.
-    let meta = std::fs::metadata(src)?;
-    let ft = meta.file_type();
-    if ft.is_dir() {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
-        }
-        let _ = std::fs::set_permissions(dst, meta.permissions());
-    } else if ft.is_file() {
-        std::fs::copy(src, dst)?;
-    }
-    // else: device/fifo/socket — nothing meaningful to copy into a volume.
-    Ok(())
+    Ok(binds)
 }
 
 /// Non-Linux builds don't run pod containers.
 #[cfg(not(target_os = "linux"))]
-fn materialize_pod_mounts(_id: &str, _mounts: &[PodMount]) -> Vec<(PathBuf, String)> {
-    Vec::new()
+fn pod_mount_binds(
+    _copies: &Path,
+    _mounts: &[PodMount],
+) -> Result<Vec<(PathBuf, String, bool)>, String> {
+    Ok(Vec::new())
 }
 
 /// Spawn the pod's shared-PID "pause": a process that is PID 1 of a fresh PID
@@ -1434,11 +1409,19 @@ fn start_init_process(
         }
     }
 
-    // Materialize CRI mounts (volumes + generated /etc/resolv.conf, /etc/hosts,
-    // /etc/hostname) into per-container writable dirs and bind them into the
-    // container (layered on top of the default mounts). Best-effort: a mount that
-    // can't be materialized is skipped, not fatal.
-    let mount_binds = materialize_pod_mounts(id, &pod.mounts);
+    // Bind the CRI mounts on top of the default container mounts. crun
+    // reports a missing or inaccessible source as a startup failure.
+    let copies = Path::new(POD_OVERLAY_DIR).join(id).join("mnt");
+    let mount_binds = match pod_mount_binds(&copies, &pod.mounts) {
+        Ok(binds) => binds,
+        Err(e) => {
+            crate::send_response(
+                stream,
+                &AgentResponse::error(e, error_codes::INTERNAL_ERROR),
+            )?;
+            return Ok(());
+        }
+    };
 
     let bundle = pod_dir(id).join("bundle");
     if let Err(e) = std::fs::create_dir_all(&bundle) {
@@ -1735,6 +1718,63 @@ mod tests {
         assert!(validate_id("-flag").is_err());
         assert!(validate_id("a/b").is_err());
         assert!(validate_id(&"x".repeat(201)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generated_files_are_copied_and_other_mounts_bind_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let share = root.path().join("share");
+        std::fs::create_dir_all(share.join("1")).unwrap();
+        std::fs::write(share.join("0"), "127.0.0.1 localhost\n").unwrap();
+        std::fs::write(share.join("2"), "nameserver 10.43.0.10\n").unwrap();
+        let mount = |n: &str, destination: &str, read_only: bool| PodMount {
+            source: share.join(n).to_string_lossy().into_owned(),
+            destination: destination.to_string(),
+            read_only,
+        };
+        let mounts = [
+            mount("0", "/etc/hosts", false),
+            mount("1", "/data", false),
+            mount("2", "/etc/resolv.conf", true),
+        ];
+        let copies = root.path().join("mnt");
+
+        let binds = pod_mount_binds(&copies, &mounts).unwrap();
+
+        assert_eq!(
+            binds,
+            [
+                (copies.join("0"), "/etc/hosts".to_string(), false),
+                (share.join("1"), "/data".to_string(), false),
+                (copies.join("2"), "/etc/resolv.conf".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(copies.join("2")).unwrap(),
+            "nameserver 10.43.0.10\n"
+        );
+        std::fs::write(copies.join("0"), "10.0.0.1 app\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(share.join("0")).unwrap(),
+            "127.0.0.1 localhost\n"
+        );
+        assert!(!copies.join("1").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_generated_file_that_cannot_be_copied_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let mounts = [PodMount {
+            source: root.path().join("missing").to_string_lossy().into_owned(),
+            destination: "/etc/hostname".to_string(),
+            read_only: false,
+        }];
+
+        let error = pod_mount_binds(&root.path().join("mnt"), &mounts).unwrap_err();
+
+        assert!(error.contains("/etc/hostname"), "{error}");
     }
 
     #[cfg(target_os = "linux")]
