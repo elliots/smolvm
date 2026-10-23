@@ -162,8 +162,15 @@ fn staged_by_root_only(_dir: &Path, _error: &std::io::Error) -> bool {
 
 #[cfg(target_os = "linux")]
 fn readonly_restore_supported() -> bool {
+    if std::env::var_os("SMOLVM_DISABLE_READONLY_RESTORE").is_some() {
+        return false;
+    }
+    // The uid drop keeps a VMM from writing a published input. A root
+    // launcher that opted out of it runs the VMM as root, which that cannot
+    // protect against, so a libkrun that only reads its input may use it too.
+    let root_without_drop = unsafe { libc::geteuid() } == 0;
     if !crate::process::vm_uid_drop_active()
-        || std::env::var_os("SMOLVM_DISABLE_READONLY_RESTORE").is_some()
+        && !(root_without_drop && libkrun_reads_restore_memory())
     {
         return false;
     }
