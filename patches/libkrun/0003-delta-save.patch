@@ -1,0 +1,1162 @@
+From 388fa9a0796f6d5cea1e54e8352ff87fd67c5c8e Mon Sep 17 00:00:00 2001
+From: Elliot Shepherd <elliot@jarofworms.com>
+Date: Sat, 24 Oct 2026 00:44:46 +1100
+Subject: [PATCH] snapshot: stream only the RAM pages that differ from a
+ caller's base
+
+FINISH_SAVE_DELTA <dir> <table length>, followed by a page table, finishes
+a prepared save as a delta. The table describes the caller's base image:
+for each 4 KiB page of the image, whether it reads as zeros, holds data
+with a seeded XXH3-128, or is unknown. The VMM reads guest RAM in 2 MiB
+blocks on four threads, with the same readers a full save uses, hashes each
+page, and for each block with a changed page streams a frame: the block
+number, a bitmap of its changed pages, a bitmap of those that hold data,
+and the bytes of the data pages only. It then publishes checkpoint.bin and
+manifest.bin without a memory image. The caller writes the pages into its
+base; the VMM never gets a descriptor of it. A table for an image of
+another length is ignored, so every page is sent.
+
+SAVE_DELTA_CAPABILITIES answers "OK delta-v2". Linux only.
+---
+ Cargo.lock                    |   7 +
+ src/libkrun/src/lib.rs        | 109 +++++
+ src/vmm/Cargo.toml            |   1 +
+ src/vmm/src/snapshot.rs       | 136 +++++-
+ src/vmm/src/snapshot/delta.rs | 763 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 1012 insertions(+), 4 deletions(-)
+ create mode 100644 src/vmm/src/snapshot/delta.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index a2e3a39..9c44740 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -910,6 +910,7 @@ dependencies = [
+  "vm-memory",
+  "vmm-sys-util 0.14.0",
+  "windows-sys 0.61.2",
++ "xxhash-rust",
+  "zstd",
+ ]
+ 
+@@ -2078,6 +2079,12 @@ dependencies = [
+  "rustix",
+ ]
+ 
++[[package]]
++name = "xxhash-rust"
++version = "0.8.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
++
+ [[package]]
+ name = "zerocopy"
+ version = "0.8.47"
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 5687db7..5adeddb 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -956,6 +956,88 @@ fn handle_finish_save(dir: &str) -> String {
+     }
+ }
+ 
++/// Counts what the delta stream wrote, so a failure knows whether the stream
++/// had started and needs an abort frame before its reply.
++#[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
++struct CountingWriter<'a, W> {
++    inner: &'a mut W,
++    written: u64,
++}
++
++#[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
++impl<W: Write> Write for CountingWriter<'_, W> {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        let written = self.inner.write(bytes)?;
++        self.written += written as u64;
++        Ok(written)
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        self.inner.flush()
++    }
++}
++
++/// `FINISH_SAVE_DELTA <dir> <table length>`, followed by the table: stream
++/// the pages of the retained RAM that differ from the caller's base (see
++/// `vmm::snapshot::DeltaTable`), then publish the checkpoint state and layout
++/// in `dir` without a memory image. Returns the reply line.
++#[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
++fn handle_finish_save_delta<W: std::io::Read + Write + Send>(arg: &str, stream: &mut W) -> String {
++    use vmm::snapshot::{DeltaTable, FRAME_ABORT};
++    let Some((dir, len)) = arg.rsplit_once(char::is_whitespace) else {
++        return "ERR EINVAL expected snapshot dir and table length\n".to_string();
++    };
++    let dir = dir.trim_end();
++    let Some(len) = len
++        .parse::<usize>()
++        .ok()
++        .filter(|len| *len <= DeltaTable::MAX_LEN)
++    else {
++        return "ERR EINVAL invalid delta table length\n".to_string();
++    };
++    let mut table = vec![0_u8; len];
++    if let Err(error) = stream.read_exact(&mut table) {
++        return format!("ERR EIO read delta table: {error}\n");
++    }
++    let table = match DeltaTable::parse(&table) {
++        Ok(table) => table,
++        Err(error) => return format!("ERR EINVAL {error}\n"),
++    };
++    let mut output = CountingWriter {
++        inner: stream,
++        written: 0,
++    };
++    let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
++        let (descs, summary) = prepared
++            .memory
++            .finish_delta(&table, &mut output)
++            .map_err(|error| (true, format!("stream RAM delta: {error}")))?;
++        publish_portable_save(
++            std::path::Path::new(dir),
++            None,
++            prepared.checkpoint,
++            &descs,
++            true,
++        )
++        .map(|_| (summary, descs.len()))
++        .map_err(|error| (false, error))
++    }) else {
++        return "ERR ENOENT no prepared durable save\n".to_string();
++    };
++    match result {
++        Ok((summary, regions)) => format!(
++            "OK saved delta ({} blocks, {} changed, {} pages, {} bytes, {regions} regions)\n",
++            summary.blocks, summary.changed_blocks, summary.changed_pages, summary.data_bytes
++        ),
++        Err((in_frames, error)) => {
++            if in_frames && output.written > 0 {
++                let _ = output.inner.write_all(&[FRAME_ABORT]);
++            }
++            format!("ERR EIO {error}\n")
++        }
++    }
++}
++
+ #[cfg(all(snapshot_supported, deferred_stream_supported))]
+ fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
+     let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
+@@ -1928,6 +2010,10 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>)
+                 // guest with device windows (virtio-fs DAX mappings stay intact).
+                 #[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
+                 "SAVE_HELD_CAPABILITIES" => "OK held-windows-in-place-v1\n".to_string(),
++                // FINISH_SAVE_DELTA streams only the 4 KiB pages of RAM that
++                // differ from a base image the caller keeps.
++                #[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
++                "SAVE_DELTA_CAPABILITIES" => "OK delta-v2\n".to_string(),
+                 "PAUSE" => match vmm.lock().unwrap().pause() {
+                     Ok(()) => "OK paused\n".to_string(),
+                     Err(e) => format!("ERR EIO {e}\n"),
+@@ -2086,6 +2172,29 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>)
+                     }
+                     return;
+                 }
++                #[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
++                "FINISH_SAVE_DELTA" => {
++                    // Like FINISH_SAVE, on its own thread, so the control
++                    // listener stays available while RAM is hashed and sent.
++                    let arg = _arg.to_string();
++                    let stream = Arc::new(Mutex::new(Some(stream)));
++                    let worker_stream = Arc::clone(&stream);
++                    let worker = std::thread::Builder::new()
++                        .name("krun delta save".into())
++                        .spawn(move || {
++                            if let Some(mut stream) = worker_stream.lock().unwrap().take() {
++                                let response = handle_finish_save_delta(&arg, &mut stream);
++                                let _ = stream.write_all(response.as_bytes());
++                            }
++                        });
++                    if let Err(error) = worker
++                        && let Some(mut stream) = stream.lock().unwrap().take()
++                    {
++                        let response = format!("ERR EAGAIN start delta save: {error}\n");
++                        let _ = stream.write_all(response.as_bytes());
++                    }
++                    return;
++                }
+                 #[cfg(all(snapshot_supported, deferred_stream_supported))]
+                 "CANCEL_SAVE" => handle_cancel_save(_arg),
+                 #[cfg(all(snapshot_supported, deferred_stream_supported))]
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 729f4f6..1d319e3 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -62,6 +62,7 @@ nix = { version = "0.30.1", features = ["fs", "term"] }
+ tdx = { version = "0.1.1", optional = true }
+ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+ kvm-ioctls = "0.24"
++xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+ hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
+diff --git a/src/vmm/src/snapshot.rs b/src/vmm/src/snapshot.rs
+index 80bc8bd..3572c7d 100644
+--- a/src/vmm/src/snapshot.rs
++++ b/src/vmm/src/snapshot.rs
+@@ -126,6 +126,14 @@ fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>>
+     }
+ }
+ 
++#[cfg(target_os = "linux")]
++mod delta;
++#[cfg(target_os = "linux")]
++pub use delta::{
++    BITMAP_BYTES, BLOCK_PAGES, BasePage, DELTA_BLOCK, DELTA_PAGE, DeltaSummary, DeltaTable,
++    FRAME_ABORT, FRAME_END, FRAME_PAGES, page_state,
++};
++
+ /// Guest RAM read as a sparse stream: one region's bytes, addressed from 0.
+ #[cfg(any(target_os = "linux", target_os = "macos"))]
+ trait SparseRamSource {
+@@ -136,6 +144,14 @@ trait SparseRamSource {
+     /// Read `buffer.len()` bytes at `offset`. Bytes that cannot hold data may
+     /// read as zero without being touched.
+     fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()>;
++    /// Whether any byte in `[from, to)` may hold data.
++    fn has_data_in(&mut self, from: u64, to: u64) -> io::Result<bool> {
++        match self.next_data(from) {
++            Ok(data) => Ok(data.is_some_and(|data| data < to)),
++            Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(true),
++            Err(error) => Err(error),
++        }
++    }
+     /// Send file-backed RAM directly to a socket when available. A source
+     /// without a file returns None so the caller uses the ordinary read path.
+     #[cfg(target_os = "linux")]
+@@ -205,6 +221,34 @@ impl<F: FnMut(&File, u64) -> io::Result<Option<u64>>> SparseRamSource for FileRa
+     }
+ }
+ 
++/// A region of an immutable RAM file, read with its own `SEEK_DATA` queries.
++#[cfg(target_os = "linux")]
++struct SeekRamSource<'a> {
++    file: &'a File,
++    start: u64,
++    len: u64,
++}
++
++#[cfg(target_os = "linux")]
++impl SparseRamSource for SeekRamSource<'_> {
++    fn len(&self) -> u64 {
++        self.len
++    }
++
++    fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>> {
++        let at = self.start + offset;
++        match next_memory_data_offset(self.file, at)? {
++            Some(data) if data < at => Err(io::Error::other("RAM data extent moved backwards")),
++            Some(data) => Ok(Some(data - self.start)),
++            None => Ok(None),
++        }
++    }
++
++    fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
++        self.file.read_exact_at(buffer, self.start + offset)
++    }
++}
++
+ /// A macOS generation region: an APFS clone file, or a region with no backing
+ /// file, which reads as zero and holds no data.
+ #[cfg(target_os = "macos")]
+@@ -1047,8 +1091,8 @@ pub fn read_guest_memory_file(
+                 io::Error::last_os_error()
+             );
+         }
+-        let extents = file_data_extents(file, offset, desc.len)?
+-            .unwrap_or_else(|| vec![(0, desc.len)]);
++        let extents =
++            file_data_extents(file, offset, desc.len)?.unwrap_or_else(|| vec![(0, desc.len)]);
+         for (start, end) in extents {
+             push_pieces(&mut work, start, end, |at, piece| PromotionPiece::Read {
+                 fd: file.as_raw_fd(),
+@@ -2465,6 +2509,17 @@ impl SparseRamSource for HeldRamSource<'_> {
+         self.region.len
+     }
+ 
++    fn has_data_in(&mut self, from: u64, to: u64) -> io::Result<bool> {
++        let mut page = from / Self::PAGE * Self::PAGE;
++        while page < to.min(self.region.len) {
++            if self.may_hold_data(page)? {
++                return Ok(true);
++            }
++            page += Self::PAGE;
++        }
++        Ok(false)
++    }
++
+     fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>> {
+         let mut page = offset / Self::PAGE * Self::PAGE;
+         while page < self.region.len {
+@@ -2626,6 +2681,75 @@ impl DeferredMemorySave {
+         Ok(regions)
+     }
+ 
++    /// Stream the pages of the image that differ from the caller's base
++    /// `table` (see [`delta`]).
++    pub fn finish_delta<W: Write + Send>(
++        self,
++        table: &DeltaTable,
++        output: &mut W,
++    ) -> io::Result<(Vec<MemoryRegionDesc>, DeltaSummary)> {
++        let stream = |sources: &delta::SourceFactory<'_>, output: &mut W| {
++            delta::stream_delta(sources, table, output, delta::DELTA_THREADS)
++        };
++        let from_files = |files: &[(&File, u64, u64)], output: &mut W| {
++            let factory = || -> io::Result<Vec<Box<dyn SparseRamSource + '_>>> {
++                Ok(files
++                    .iter()
++                    .map(|&(file, start, len)| {
++                        Box::new(SeekRamSource { file, start, len })
++                            as Box<dyn SparseRamSource + '_>
++                    })
++                    .collect())
++            };
++            stream(&factory, output)
++        };
++        match self.generation {
++            DeferredLinuxGeneration::Held(held) => {
++                held.ensure_valid()?;
++                let factory = || -> io::Result<Vec<Box<dyn SparseRamSource + '_>>> {
++                    Ok(held
++                        .sources()?
++                        .into_iter()
++                        .map(|source| Box::new(source) as Box<dyn SparseRamSource + '_>)
++                        .collect())
++                };
++                let summary = stream(&factory, output)?;
++                held.ensure_valid()?;
++                Ok((held.descs(), summary))
++            }
++            DeferredLinuxGeneration::Layered(generation) => {
++                let summary = from_files(&generation.memory_sources(), output)?;
++                Ok((generation.memory_regions(), summary))
++            }
++            generation => {
++                let (descs, files) = match generation {
++                    DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
++                    DeferredLinuxGeneration::Copy(copy) => copy.finish()?,
++                    _ => unreachable!("held and layered generations are handled above"),
++                };
++                if descs.len() != files.len() {
++                    return Err(io::Error::other(
++                        "RAM generation descriptor/file count mismatch",
++                    ));
++                }
++                let sources: Vec<(&File, u64, u64)> = descs
++                    .iter()
++                    .zip(&files)
++                    .map(|(desc, file)| (file, desc.offset, desc.len))
++                    .collect();
++                let summary = from_files(&sources, output)?;
++                let regions = descs
++                    .iter()
++                    .map(|desc| MemoryRegionDesc {
++                        gpa: desc.gpa,
++                        len: desc.len,
++                    })
++                    .collect();
++                Ok((regions, summary))
++            }
++        }
++    }
++
+     /// Materialize this immutable generation into the portable sparse-memory
+     /// stream after the source has resumed.
+     pub fn finish(self, output: &mut File) -> io::Result<Vec<MemoryRegionDesc>> {
+@@ -6455,10 +6579,14 @@ mod tests {
+         memory.read_slice(&mut ram, GuestAddress(0x1000)).unwrap();
+         assert!(ram == image[..0x20_0000]);
+         let mut ram = vec![0_u8; 0x10_0000];
+-        memory.read_slice(&mut ram, GuestAddress(0x40_0000)).unwrap();
++        memory
++            .read_slice(&mut ram, GuestAddress(0x40_0000))
++            .unwrap();
+         assert!(ram == image[0x20_0000..]);
+ 
+-        memory.write_slice(&[0x11; 16], GuestAddress(0x2000)).unwrap();
++        memory
++            .write_slice(&[0x11; 16], GuestAddress(0x2000))
++            .unwrap();
+         let mut backing = [0_u8; 16];
+         file.read_exact_at(&mut backing, 0x1000).unwrap();
+         assert_eq!(backing, [0xA5; 16], "restored RAM must not alias the image");
+diff --git a/src/vmm/src/snapshot/delta.rs b/src/vmm/src/snapshot/delta.rs
+new file mode 100644
+index 0000000..b679d25
+--- /dev/null
++++ b/src/vmm/src/snapshot/delta.rs
+@@ -0,0 +1,763 @@
++// Copyright 2026. SPDX-License-Identifier: Apache-2.0
++//
++//! Delta saves: stream only the pages of the RAM image that differ from a
++//! base image the caller keeps.
++//!
++//! The caller sends a page table: for each 4 KiB page of the image (image
++//! offset `k * 4 KiB`), whether its base holds a hole, data with a given
++//! seeded XXH3-128, or something unknown. The VMM hashes each page of guest
++//! RAM as it reads it and streams, per 2 MiB block, the pages whose state
++//! differs. Applying the frames to the base at their offsets gives the new
++//! image exactly. The VMM never writes the base.
++//!
++//! Table (caller to VMM), little-endian: `SMOLDTB2`, block size u64, page size
++//! u64, image length u64, seed u64, page count u64, then per page a state
++//! byte (0 unknown, 1 hole, 2 data) and a u128 hash (zero unless data).
++//!
++//! Stream (VMM to caller), little-endian: `SMOLDLT2`, block size u64, page
++//! size u64, image length u64, block count u64, then frames. A frame starts
++//! with a tag byte: [`FRAME_PAGES`] for a block with changed pages, followed
++//! by the block number u64, a bitmap of its changed pages and a bitmap of the
++//! changed pages that hold data (64 bytes each, page `i` of the block is bit
++//! `i % 8` of byte `i / 8`), then the bytes of each data page in order; a
++//! changed page without data reads as zeros. [`FRAME_END`] is followed by the
++//! block count, the changed block count, the changed page count and the data
++//! bytes sent (four u64); [`FRAME_ABORT`] means the save failed. A text reply
++//! line follows the end or the abort. Pages past the image's end never have
++//! a bit set, and the last page of the image may be short.
++
++use std::io::{self, Write};
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++
++use super::SparseRamSource;
++
++/// The block size of a delta stream's frames.
++pub const DELTA_BLOCK: u64 = 2 << 20;
++/// The page size of change detection.
++pub const DELTA_PAGE: u64 = 4096;
++/// Pages in a block.
++pub const BLOCK_PAGES: usize = (DELTA_BLOCK / DELTA_PAGE) as usize;
++/// Bytes of one bitmap of a frame.
++pub const BITMAP_BYTES: usize = BLOCK_PAGES / 8;
++const TABLE_MAGIC: &[u8; 8] = b"SMOLDTB2";
++const STREAM_MAGIC: &[u8; 8] = b"SMOLDLT2";
++/// The save failed; a reply line follows.
++pub const FRAME_ABORT: u8 = 0;
++/// A block with changed pages: its number, two bitmaps and the data pages.
++pub const FRAME_PAGES: u8 = 1;
++/// The end of the frames, followed by the totals and a reply line.
++pub const FRAME_END: u8 = 3;
++/// 1 TiB of RAM: far above any guest, small enough to allocate the table.
++const MAX_PAGES: u64 = 1 << 28;
++const TABLE_HEADER: usize = 48;
++const TABLE_ENTRY: usize = 17;
++const FRAME_HEADER: usize = 1 + 8 + 2 * BITMAP_BYTES;
++/// Threads that read and hash guest RAM.
++pub const DELTA_THREADS: usize = 4;
++
++/// What the caller's base holds for one page.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BasePage {
++    /// Nothing known: always sent.
++    Unknown,
++    /// Reads as zeros.
++    Hole,
++    /// Data with this seeded XXH3-128.
++    Data(u128),
++}
++
++/// The caller's description of its base image.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DeltaTable {
++    pub seed: u64,
++    pub image_len: u64,
++    pub pages: Vec<BasePage>,
++}
++
++/// Totals of a delta stream.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct DeltaSummary {
++    /// Blocks in the image.
++    pub blocks: u64,
++    /// Blocks with a frame.
++    pub changed_blocks: u64,
++    /// Pages sent, with data or as zeros.
++    pub changed_pages: u64,
++    /// Bytes of the data pages sent.
++    pub data_bytes: u64,
++}
++
++fn invalid(message: &str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
++}
++
++fn u64_at(bytes: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
++}
++
++impl DeltaTable {
++    /// The largest table [`Self::parse`] accepts, in bytes.
++    pub const MAX_LEN: usize = TABLE_HEADER + MAX_PAGES as usize * TABLE_ENTRY;
++
++    pub fn parse(bytes: &[u8]) -> io::Result<Self> {
++        if bytes.len() < TABLE_HEADER || &bytes[..8] != TABLE_MAGIC {
++            return Err(invalid("not a delta page table"));
++        }
++        if u64_at(bytes, 8) != DELTA_BLOCK || u64_at(bytes, 16) != DELTA_PAGE {
++            return Err(invalid("unsupported delta block or page size"));
++        }
++        let image_len = u64_at(bytes, 24);
++        let seed = u64_at(bytes, 32);
++        let count = u64_at(bytes, 40);
++        if count > MAX_PAGES || count != image_len.div_ceil(DELTA_PAGE) {
++            return Err(invalid("delta page count does not match the image length"));
++        }
++        if bytes.len() != TABLE_HEADER + count as usize * TABLE_ENTRY {
++            return Err(invalid("delta page table has the wrong length"));
++        }
++        let pages = bytes[TABLE_HEADER..]
++            .as_chunks::<TABLE_ENTRY>()
++            .0
++            .iter()
++            .map(|entry| {
++                let hash = u128::from_le_bytes(entry[1..].try_into().unwrap());
++                match entry[0] {
++                    0 => Ok(BasePage::Unknown),
++                    1 => Ok(BasePage::Hole),
++                    2 => Ok(BasePage::Data(hash)),
++                    _ => Err(invalid("unknown delta page state")),
++                }
++            })
++            .collect::<io::Result<_>>()?;
++        Ok(Self {
++            seed,
++            image_len,
++            pages,
++        })
++    }
++
++    pub fn encode(&self) -> Vec<u8> {
++        let mut bytes = Vec::with_capacity(TABLE_HEADER + self.pages.len() * TABLE_ENTRY);
++        bytes.extend_from_slice(TABLE_MAGIC);
++        for value in [
++            DELTA_BLOCK,
++            DELTA_PAGE,
++            self.image_len,
++            self.seed,
++            self.pages.len() as u64,
++        ] {
++            bytes.extend_from_slice(&value.to_le_bytes());
++        }
++        for page in &self.pages {
++            let (state, hash) = match page {
++                BasePage::Unknown => (0_u8, 0),
++                BasePage::Hole => (1, 0),
++                BasePage::Data(hash) => (2, *hash),
++            };
++            bytes.push(state);
++            bytes.extend_from_slice(&hash.to_le_bytes());
++        }
++        bytes
++    }
++}
++
++/// The state of a page's bytes: a hole when they are all zero.
++pub fn page_state(bytes: &[u8], seed: u64) -> BasePage {
++    if is_zero(bytes) {
++        BasePage::Hole
++    } else {
++        BasePage::Data(xxhash_rust::xxh3::xxh3_128_with_seed(bytes, seed))
++    }
++}
++
++fn is_zero(bytes: &[u8]) -> bool {
++    // SAFETY: any bit pattern is a valid u128.
++    let (head, body, tail) = unsafe { bytes.align_to::<u128>() };
++    head.iter().all(|&b| b == 0) && body.iter().all(|&w| w == 0) && tail.iter().all(|&b| b == 0)
++}
++
++/// Sources that make up the image, in order. Called once per thread, so each
++/// thread reads with its own cursors.
++pub(super) type SourceFactory<'a> =
++    dyn Fn() -> io::Result<Vec<Box<dyn SparseRamSource + 'a>>> + Sync + 'a;
++
++/// Read block `[start, start + buffer.len())` of the image into `buffer`.
++/// Parts that cannot hold data are not read and are zero. Returns whether any
++/// part may hold data.
++fn read_block(
++    sources: &mut [Box<dyn SparseRamSource + '_>],
++    starts: &[u64],
++    start: u64,
++    buffer: &mut [u8],
++) -> io::Result<bool> {
++    let end = start + buffer.len() as u64;
++    let mut data = false;
++    for (source, &base) in sources.iter_mut().zip(starts) {
++        let len = source.len();
++        if base >= end || base + len <= start {
++            continue;
++        }
++        let from = start.max(base) - base;
++        let to = end.min(base + len) - base;
++        let part = &mut buffer[(base + from - start) as usize..(base + to - start) as usize];
++        if source.has_data_in(from, to)? {
++            source.read_exact_at(part, from)?;
++            data = true;
++        } else {
++            part.fill(0);
++        }
++    }
++    Ok(data)
++}
++
++/// Build in `frame` the frame of block `block`, whose bytes are `bytes`,
++/// against the base pages `base` (all unknown when `None`). Returns the
++/// changed pages and the data bytes, or `None` when no page changed.
++fn build_frame(
++    frame: &mut Vec<u8>,
++    block: u64,
++    bytes: &[u8],
++    data: bool,
++    base: Option<&[BasePage]>,
++    seed: u64,
++) -> Option<(u64, u64)> {
++    frame.clear();
++    frame.push(FRAME_PAGES);
++    frame.extend_from_slice(&block.to_le_bytes());
++    frame.resize(FRAME_HEADER, 0);
++    let (mut pages, mut data_bytes) = (0_u64, 0_u64);
++    for (page, page_bytes) in bytes.chunks(DELTA_PAGE as usize).enumerate() {
++        let now = if data {
++            page_state(page_bytes, seed)
++        } else {
++            BasePage::Hole
++        };
++        let was = base.map_or(BasePage::Unknown, |base| base[page]);
++        if was != BasePage::Unknown && was == now {
++            continue;
++        }
++        let (byte, bit) = (9 + page / 8, 1 << (page % 8));
++        frame[byte] |= bit;
++        pages += 1;
++        if let BasePage::Data(_) = now {
++            frame[byte + BITMAP_BYTES] |= bit;
++            frame.extend_from_slice(page_bytes);
++            data_bytes += page_bytes.len() as u64;
++        }
++    }
++    (pages > 0).then_some((pages, data_bytes))
++}
++
++/// Write the delta of the image `sources` describes against `table` to
++/// `output`, reading and hashing on `threads` threads. A table for an image
++/// of another length is ignored: every page is sent.
++pub(super) fn stream_delta<W: Write + Send>(
++    sources: &SourceFactory<'_>,
++    table: &DeltaTable,
++    output: &mut W,
++    threads: usize,
++) -> io::Result<DeltaSummary> {
++    let lens: Vec<u64> = sources()?.iter().map(|source| source.len()).collect();
++    let mut starts = Vec::with_capacity(lens.len());
++    let mut image_len = 0_u64;
++    for len in lens {
++        starts.push(image_len);
++        image_len = image_len
++            .checked_add(len)
++            .ok_or_else(|| io::Error::other("memory image too large"))?;
++    }
++    if image_len == 0 {
++        return Err(io::Error::other("empty RAM image"));
++    }
++    let count = image_len.div_ceil(DELTA_BLOCK);
++    let base = (table.image_len == image_len).then_some(table.pages.as_slice());
++    output.write_all(STREAM_MAGIC)?;
++    for value in [DELTA_BLOCK, DELTA_PAGE, image_len, count] {
++        output.write_all(&value.to_le_bytes())?;
++    }
++
++    let next = AtomicU64::new(0);
++    let failed = AtomicBool::new(false);
++    let output = Mutex::new(Output {
++        writer: output,
++        summary: DeltaSummary {
++            blocks: count,
++            ..Default::default()
++        },
++    });
++    let work = || -> io::Result<()> {
++        let mut sources = sources()?;
++        let mut buffer = vec![0_u8; DELTA_BLOCK as usize];
++        let mut frame = Vec::with_capacity(FRAME_HEADER + DELTA_BLOCK as usize);
++        while !failed.load(Ordering::Relaxed) {
++            let block = next.fetch_add(1, Ordering::Relaxed);
++            if block >= count {
++                break;
++            }
++            let start = block * DELTA_BLOCK;
++            let len = (image_len - start).min(DELTA_BLOCK) as usize;
++            let bytes = &mut buffer[..len];
++            let data = read_block(&mut sources, &starts, start, bytes)?;
++            let first = (start / DELTA_PAGE) as usize;
++            let pages = len.div_ceil(DELTA_PAGE as usize);
++            let base = base.map(|base| &base[first..first + pages]);
++            let Some((pages, data_bytes)) =
++                build_frame(&mut frame, block, bytes, data, base, table.seed)
++            else {
++                continue;
++            };
++            let mut output = output.lock().unwrap();
++            output.writer.write_all(&frame)?;
++            output.summary.changed_blocks += 1;
++            output.summary.changed_pages += pages;
++            output.summary.data_bytes += data_bytes;
++        }
++        Ok(())
++    };
++    let work = || {
++        let result = work();
++        if result.is_err() {
++            failed.store(true, Ordering::Relaxed);
++        }
++        result
++    };
++    std::thread::scope(|scope| -> io::Result<()> {
++        let workers: Vec<_> = (1..threads.max(1)).map(|_| scope.spawn(work)).collect();
++        let mut result = work();
++        for worker in workers {
++            let joined = worker
++                .join()
++                .unwrap_or_else(|_| Err(io::Error::other("delta save thread panicked")));
++            result = result.and(joined);
++        }
++        result
++    })?;
++    let Output { writer, summary } = output.into_inner().unwrap();
++    writer.write_all(&[FRAME_END])?;
++    for value in [
++        summary.blocks,
++        summary.changed_blocks,
++        summary.changed_pages,
++        summary.data_bytes,
++    ] {
++        writer.write_all(&value.to_le_bytes())?;
++    }
++    Ok(summary)
++}
++
++struct Output<'w, W> {
++    writer: &'w mut W,
++    summary: DeltaSummary,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Read;
++
++    const PAGE: u64 = DELTA_PAGE;
++
++    /// RAM held in a vector. Pages marked absent cannot hold data, as anonymous
++    /// pages that were never written.
++    struct VecSource<'a> {
++        bytes: &'a [u8],
++        present: &'a [bool],
++    }
++
++    impl SparseRamSource for VecSource<'_> {
++        fn len(&self) -> u64 {
++            self.bytes.len() as u64
++        }
++
++        fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>> {
++            let first = (offset / PAGE) as usize;
++            Ok((first..self.present.len())
++                .find(|&page| self.present[page])
++                .map(|page| (page as u64 * PAGE).max(offset)))
++        }
++
++        fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
++            for (at, byte) in buffer.iter_mut().enumerate() {
++                let at = offset as usize + at;
++                *byte = if self.present[at / PAGE as usize] {
++                    self.bytes[at]
++                } else {
++                    0
++                };
++            }
++            Ok(())
++        }
++    }
++
++    /// Regions of a test image, with no page present.
++    struct Image {
++        regions: Vec<Vec<u8>>,
++        present: Vec<Vec<bool>>,
++    }
++
++    impl Image {
++        fn new(lens: &[usize]) -> Self {
++            Self {
++                regions: lens.iter().map(|&len| vec![0; len]).collect(),
++                present: lens
++                    .iter()
++                    .map(|&len| vec![false; len.div_ceil(PAGE as usize)])
++                    .collect(),
++            }
++        }
++
++        /// Write `byte` over `len` bytes at image offset `at`.
++        fn fill(&mut self, at: usize, len: usize, byte: u8) {
++            let mut base = 0;
++            for (region, present) in self.regions.iter_mut().zip(&mut self.present) {
++                for offset in at.max(base)..(at + len).min(base + region.len()) {
++                    region[offset - base] = byte;
++                    present[(offset - base) / PAGE as usize] = true;
++                }
++                base += region.len();
++            }
++        }
++
++        fn flat(&self) -> Vec<u8> {
++            self.regions.concat()
++        }
++
++        fn table(&self, seed: u64) -> DeltaTable {
++            let flat = self.flat();
++            DeltaTable {
++                seed,
++                image_len: flat.len() as u64,
++                pages: flat
++                    .chunks(PAGE as usize)
++                    .map(|page| page_state(page, seed))
++                    .collect(),
++            }
++        }
++
++        fn delta(&self, table: &DeltaTable) -> (Vec<u8>, DeltaSummary) {
++            let factory = || -> io::Result<Vec<Box<dyn SparseRamSource + '_>>> {
++                Ok(self
++                    .regions
++                    .iter()
++                    .zip(&self.present)
++                    .map(|(bytes, present)| {
++                        Box::new(VecSource { bytes, present }) as Box<dyn SparseRamSource + '_>
++                    })
++                    .collect())
++            };
++            let mut stream = Vec::new();
++            let summary = stream_delta(&factory, table, &mut stream, DELTA_THREADS).unwrap();
++            (stream, summary)
++        }
++    }
++
++    fn read_u64(stream: &mut &[u8]) -> u64 {
++        let mut bytes = [0; 8];
++        stream.read_exact(&mut bytes).unwrap();
++        u64::from_le_bytes(bytes)
++    }
++
++    /// What a stream changed: the pages sent, sorted, and the totals.
++    #[derive(Debug, Default)]
++    struct Applied {
++        blocks: Vec<u64>,
++        pages: Vec<u64>,
++        summary: DeltaSummary,
++    }
++
++    /// Apply a delta stream to `base` as the caller does, checking each frame.
++    fn apply(base: &mut Vec<u8>, mut stream: &[u8]) -> Applied {
++        let mut magic = [0; 8];
++        stream.read_exact(&mut magic).unwrap();
++        assert_eq!(&magic, STREAM_MAGIC);
++        assert_eq!(read_u64(&mut stream), DELTA_BLOCK);
++        assert_eq!(read_u64(&mut stream), DELTA_PAGE);
++        let image_len = read_u64(&mut stream);
++        let count = read_u64(&mut stream);
++        assert_eq!(count, image_len.div_ceil(DELTA_BLOCK));
++        base.resize(image_len as usize, 0);
++        let mut applied = Applied::default();
++        loop {
++            let mut tag = [0];
++            stream.read_exact(&mut tag).unwrap();
++            match tag[0] {
++                FRAME_PAGES => {
++                    let block = read_u64(&mut stream);
++                    assert!(block < count);
++                    assert!(!applied.blocks.contains(&block), "one frame per block");
++                    let mut maps = [0_u8; 2 * BITMAP_BYTES];
++                    stream.read_exact(&mut maps).unwrap();
++                    let (changed, data) = maps.split_at(BITMAP_BYTES);
++                    let mut any = false;
++                    for page in 0..BLOCK_PAGES {
++                        let bit = 1 << (page % 8);
++                        let is_changed = changed[page / 8] & bit != 0;
++                        let is_data = data[page / 8] & bit != 0;
++                        assert!(is_changed || !is_data, "data pages are changed pages");
++                        if !is_changed {
++                            continue;
++                        }
++                        any = true;
++                        let start = block * DELTA_BLOCK + page as u64 * PAGE;
++                        assert!(start < image_len, "no page past the image");
++                        let end = (start + PAGE).min(image_len) as usize;
++                        let bytes = &mut base[start as usize..end];
++                        if is_data {
++                            stream.read_exact(bytes).unwrap();
++                            applied.summary.data_bytes += bytes.len() as u64;
++                        } else {
++                            bytes.fill(0);
++                        }
++                        applied.pages.push(start / PAGE);
++                    }
++                    assert!(any, "a frame changes a page");
++                    applied.blocks.push(block);
++                }
++                FRAME_END => {
++                    let summary = DeltaSummary {
++                        blocks: read_u64(&mut stream),
++                        changed_blocks: read_u64(&mut stream),
++                        changed_pages: read_u64(&mut stream),
++                        data_bytes: read_u64(&mut stream),
++                    };
++                    assert!(stream.is_empty(), "nothing follows the end frame");
++                    assert_eq!(summary.blocks, count);
++                    assert_eq!(summary.changed_blocks, applied.blocks.len() as u64);
++                    assert_eq!(summary.changed_pages, applied.pages.len() as u64);
++                    assert_eq!(summary.data_bytes, applied.summary.data_bytes);
++                    applied.summary = summary;
++                    applied.blocks.sort_unstable();
++                    applied.pages.sort_unstable();
++                    return applied;
++                }
++                tag => panic!("unexpected frame {tag}"),
++            }
++        }
++    }
++
++    const MIB: usize = 1 << 20;
++    const PAGES: u64 = BLOCK_PAGES as u64;
++
++    /// Three regions: 3 MiB, 2 MiB + 12 KiB and 1 MiB. Block 1 spans the first
++    /// two, block 2 spans the last two, and block 3 is 12 KiB long.
++    fn regions() -> Vec<usize> {
++        vec![3 * MIB, 2 * MIB + 12 * 1024, MIB]
++    }
++
++    #[test]
++    fn a_delta_applied_to_its_base_gives_the_new_image() {
++        let mut old = Image::new(&regions());
++        old.fill(0, 2 * MIB, 0x11);
++        old.fill(3 * MIB - 4096, 8192, 0x22);
++        old.fill(5 * MIB, 4096, 0x33);
++        old.fill(6 * MIB + 4096, 4096, 0x44);
++        let seed = 0x5eed;
++        let table = old.table(seed);
++        assert_eq!(table.pages.len(), 3 * 512 + 3);
++
++        let mut new = Image::new(&regions());
++        // Block 0 becomes holes, as freed and zeroed memory does.
++        // Block 1 changes on both sides of the region boundary.
++        new.fill(3 * MIB - 4096, 8192, 0x23);
++        // Block 2 keeps its bytes, though a page of zeros is now present.
++        new.fill(5 * MIB, 4096, 0x33);
++        new.fill(4 * MIB, 4096, 0x00);
++        // The short final block changes one page.
++        new.fill(6 * MIB + 4096, 4096, 0x45);
++
++        let (stream, summary) = new.delta(&table);
++        let mut base = old.flat();
++        let applied = apply(&mut base, &stream);
++        assert!(base == new.flat(), "the base becomes the new image");
++        assert_eq!(applied.blocks, [0, 1, 3]);
++        let mut pages: Vec<u64> = (0..PAGES).collect();
++        pages.extend([767, 768, 3 * PAGES + 1]);
++        assert_eq!(applied.pages, pages);
++        assert_eq!(
++            summary,
++            DeltaSummary {
++                blocks: 4,
++                changed_blocks: 3,
++                changed_pages: PAGES + 3,
++                data_bytes: 3 * PAGE,
++            }
++        );
++        // The new image against its own table sends nothing.
++        let (stream, summary) = new.delta(&new.table(seed));
++        let applied = apply(&mut base, &stream);
++        assert!(applied.blocks.is_empty());
++        assert_eq!(summary.changed_pages, 0);
++        assert!(base == new.flat());
++    }
++
++    #[test]
++    fn a_block_with_one_changed_page_sends_only_that_page() {
++        let mut old = Image::new(&[4 * MIB]);
++        old.fill(0, 4 * MIB, 0x5a);
++        let mut new = Image::new(&[4 * MIB]);
++        new.fill(0, 4 * MIB, 0x5a);
++        new.fill(2 * MIB + 77 * 4096 + 100, 1, 0x01);
++        let (stream, summary) = new.delta(&old.table(9));
++        assert_eq!(stream.len(), 8 + 32 + FRAME_HEADER + 4096 + 1 + 32);
++        let mut base = old.flat();
++        let applied = apply(&mut base, &stream);
++        assert_eq!(applied.blocks, [1]);
++        assert_eq!(applied.pages, [PAGES + 77]);
++        assert_eq!(summary.data_bytes, PAGE);
++        assert!(base == new.flat());
++    }
++
++    #[test]
++    fn a_block_with_every_page_changed_sends_the_whole_block() {
++        let mut old = Image::new(&[2 * MIB + 8192]);
++        old.fill(0, 2 * MIB + 8192, 0x10);
++        let mut new = Image::new(&[2 * MIB + 8192]);
++        new.fill(0, 2 * MIB, 0x20);
++        // The short final block: one page becomes zeros, one changes.
++        new.fill(2 * MIB + 4096, 4096, 0x21);
++        let (stream, summary) = new.delta(&old.table(4));
++        let mut base = old.flat();
++        let applied = apply(&mut base, &stream);
++        assert!(base == new.flat());
++        assert_eq!(applied.blocks, [0, 1]);
++        assert_eq!(summary.changed_pages, PAGES + 2);
++        assert_eq!(summary.data_bytes, DELTA_BLOCK + PAGE);
++    }
++
++    #[test]
++    fn holes_that_become_data_and_unknown_pages_are_sent() {
++        let old = Image::new(&regions());
++        let mut table = old.table(7);
++        assert!(table.pages.iter().all(|page| *page == BasePage::Hole));
++        let mut new = Image::new(&regions());
++        new.fill(2 * MIB + 100, 1, 0x01);
++        table.pages[3 * 512 + 2] = BasePage::Unknown;
++        let (stream, summary) = new.delta(&table);
++        let mut base = old.flat();
++        let applied = apply(&mut base, &stream);
++        assert_eq!(applied.blocks, [1, 3]);
++        assert_eq!(applied.pages, [PAGES, 3 * PAGES + 2]);
++        assert_eq!(summary.data_bytes, PAGE, "an unknown hole is sent as zeros");
++        assert!(base == new.flat());
++    }
++
++    #[test]
++    fn a_short_final_page_is_sent_short() {
++        let len = MIB + 4096 + 100;
++        let old = Image::new(&[len]);
++        let mut new = Image::new(&[len]);
++        new.fill(MIB + 4096, 100, 0x77);
++        let table = old.table(1);
++        assert_eq!(table.pages.len(), 258);
++        let (stream, summary) = new.delta(&table);
++        let mut base = old.flat();
++        let applied = apply(&mut base, &stream);
++        assert_eq!(applied.pages, [257]);
++        assert_eq!(summary.data_bytes, 100);
++        assert!(base == new.flat());
++    }
++
++    #[test]
++    fn a_table_for_another_image_length_sends_every_page() {
++        let mut old = Image::new(&[4 * MIB]);
++        old.fill(0, 4 * MIB, 0x55);
++        let mut new = Image::new(&regions());
++        new.fill(MIB, 3 * MIB, 0x55);
++        let (stream, summary) = new.delta(&old.table(1));
++        let mut base = old.flat();
++        let applied = apply(&mut base, &stream);
++        assert_eq!(applied.blocks, [0, 1, 2, 3]);
++        assert_eq!(summary.changed_pages, 3 * PAGES + 3);
++        assert_eq!(summary.data_bytes, 3 * MIB as u64);
++        assert!(base == new.flat());
++    }
++
++    #[test]
++    fn the_seed_changes_every_hash() {
++        let mut image = Image::new(&[DELTA_BLOCK as usize]);
++        image.fill(0, 4096, 0x99);
++        assert_ne!(image.table(1).pages, image.table(2).pages);
++        let (_, summary) = image.delta(&image.table(1));
++        assert_eq!(summary.changed_pages, 0);
++        let mut other = image.table(2);
++        other.seed = 1;
++        let (_, summary) = image.delta(&other);
++        assert_eq!(
++            summary.changed_pages, 1,
++            "hashes of another seed never match"
++        );
++    }
++
++    #[test]
++    fn a_held_save_streams_the_delta_of_guest_ram() {
++        use std::sync::Arc;
++        use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
++        const HIGH: u64 = 0x1000_0000;
++        let memory = crate::GuestMemoryMmap::from_ranges(&[
++            (GuestAddress(0), 3 * MIB),
++            (GuestAddress(HIGH), 2 * MIB + 12 * 1024),
++        ])
++        .unwrap();
++        memory
++            .write_slice(&[0x11; 4096], GuestAddress(0x1000))
++            .unwrap();
++        memory
++            .write_slice(&[0x22; 4096], GuestAddress(3 * MIB as u64 - 4096))
++            .unwrap();
++        memory
++            .write_slice(&[0x33; 4096], GuestAddress(HIGH))
++            .unwrap();
++        memory
++            .write_slice(&[0x44; 100], GuestAddress(HIGH + 2 * MIB as u64))
++            .unwrap();
++        let image_len = 5 * MIB as u64 + 12 * 1024;
++        let empty = DeltaTable {
++            seed: 3,
++            image_len,
++            pages: vec![BasePage::Hole; image_len.div_ceil(PAGE) as usize],
++        };
++        let valid = Arc::new(AtomicBool::new(true));
++        let save = super::super::start_held_memory_save(&memory, &[], None, valid).unwrap();
++        let mut stream = Vec::new();
++        let (descs, summary) = save.finish_delta(&empty, &mut stream).unwrap();
++        assert_eq!(descs.len(), 2);
++        assert_eq!(summary.changed_blocks, 3);
++        assert_eq!(summary.changed_pages, 4);
++
++        let mut expected = Vec::new();
++        for region in memory.iter() {
++            let mut bytes = vec![0; region.len() as usize];
++            memory.read_slice(&mut bytes, region.start_addr()).unwrap();
++            expected.extend_from_slice(&bytes);
++        }
++        let mut base = vec![0; image_len as usize];
++        let applied = apply(&mut base, &stream);
++        assert_eq!(applied.pages, [1, 767, 768, 1280]);
++        assert!(base == expected, "the delta rebuilds guest RAM");
++    }
++
++    #[test]
++    fn a_table_round_trips_and_bad_tables_are_refused() {
++        let mut image = Image::new(&regions());
++        image.fill(0, 1, 1);
++        let mut table = image.table(42);
++        table.pages[2] = BasePage::Unknown;
++        let bytes = table.encode();
++        assert_eq!(bytes.len(), TABLE_HEADER + (3 * 512 + 3) * TABLE_ENTRY);
++        assert_eq!(DeltaTable::parse(&bytes).unwrap(), table);
++        assert!(DeltaTable::parse(&bytes[..bytes.len() - 1]).is_err());
++        let mut wrong_count = bytes.clone();
++        wrong_count[24..32].copy_from_slice(&(DELTA_BLOCK * 9).to_le_bytes());
++        assert!(DeltaTable::parse(&wrong_count).is_err());
++        let mut wrong_state = bytes.clone();
++        wrong_state[TABLE_HEADER] = 9;
++        assert!(DeltaTable::parse(&wrong_state).is_err());
++        let mut wrong_page = bytes.clone();
++        wrong_page[16..24].copy_from_slice(&65536_u64.to_le_bytes());
++        assert!(DeltaTable::parse(&wrong_page).is_err());
++        let mut old_version = bytes;
++        old_version[..8].copy_from_slice(b"SMOLDTB1");
++        assert!(DeltaTable::parse(&old_version).is_err());
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

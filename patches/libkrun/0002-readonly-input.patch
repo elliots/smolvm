@@ -1,0 +1,72 @@
+From e3327ec8c40e5390ef1225ad983d138d62b37565 Mon Sep 17 00:00:00 2001
+From: Elliot Shepherd <elliot@jarofworms.com>
+Date: Mon, 19 Oct 2026 12:35:38 +1100
+Subject: [PATCH] restore: accept a read-only RAM input when reading it into
+ anonymous memory
+
+---
+ src/libkrun/src/lib.rs  | 19 ++++++++++++++-----
+ src/vmm/src/snapshot.rs |  8 ++++++++
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index e75beac..5687db7 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -1648,11 +1648,10 @@ fn build_restore_ctx_with_memory_mode(
+         let checkpoint =
+             std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
+         let memory_path = dir.join("memory.bin");
++        // A Linux restore either promotes the input into forkable memory or
++        // reads it into anonymous memory (`read_guest_memory_file`); neither
++        // writes to it, so a read-only input serves both.
+         let memory_file = if let Some(_file) = readonly_memory {
+-            #[cfg(target_os = "linux")]
+-            if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1") {
+-                return Err("read-only restore memory requires Linux forkable promotion".into());
+-            }
+             #[cfg(not(target_os = "linux"))]
+             return Err("read-only restore memory is unsupported on this platform".into());
+             #[cfg(target_os = "linux")]
+@@ -4359,9 +4358,19 @@ pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c
+     }
+ }
+ 
++/// Whether a restore that is not branchable reads its RAM into anonymous
++/// memory, so that it accepts a read-only memory input from
++/// [`krun_set_snapshot_memory_fd`] as a branchable one does. Returns 1.
++#[cfg(all(target_os = "linux", fork_supported))]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_restore_reads_memory() -> i32 {
++    1
++}
++
+ /// Use a read-only regular-file descriptor for portable snapshot RAM.
+ /// The library duplicates the descriptor; the caller retains ownership.
+-/// Supported only by Linux branchable restores, which create private memfds.
++/// Supported by Linux restores: a branchable one promotes it into private
++/// memfds, any other reads it into anonymous memory.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
+     set_snapshot_memory_input(ctx_id, fd, false)
+diff --git a/src/vmm/src/snapshot.rs b/src/vmm/src/snapshot.rs
+index 4398d7c..80bc8bd 100644
+--- a/src/vmm/src/snapshot.rs
++++ b/src/vmm/src/snapshot.rs
+@@ -6465,5 +6465,13 @@ mod tests {
+ 
+         let short = create_guest_ram_memfd(0x20_0000).expect("short memory image");
+         assert!(read_guest_memory_file(&descs, &short).is_err());
++
++        // A read-only input, as smolvm hands a resume, reads the same.
++        let readonly = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
++            .expect("read-only memory image");
++        let memory = read_guest_memory_file(&descs, &readonly).expect("read read-only image");
++        let mut ram = vec![0_u8; 0x20_0000];
++        memory.read_slice(&mut ram, GuestAddress(0x1000)).unwrap();
++        assert!(ram == image[..0x20_0000]);
+     }
+ }
+-- 
+2.50.1 (Apple Git-155)
+

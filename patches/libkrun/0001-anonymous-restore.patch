@@ -1,0 +1,170 @@
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 8a32885..e75beac 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -1697,8 +1697,8 @@ fn build_restore_ctx_with_memory_mode(
+             vmm::snapshot::map_guest_memory_file_forkable(&descs, &memory_file)
+                 .map_err(|e| format!("promote portable guest memory: {e}"))?
+         } else {
+-            vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
+-                .map_err(|e| format!("map guest memory: {e}"))?
++            vmm::snapshot::read_guest_memory_file(&descs, &memory_file)
++                .map_err(|e| format!("read guest memory: {e}"))?
+         };
+         #[cfg(all(unix, not(target_os = "linux")))]
+         let guest_memory = vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
+diff --git a/src/vmm/src/snapshot.rs b/src/vmm/src/snapshot.rs
+index f2657a5..4398d7c 100644
+--- a/src/vmm/src/snapshot.rs
++++ b/src/vmm/src/snapshot.rs
+@@ -996,6 +996,101 @@ pub fn map_guest_memory_file_forkable(
+         .map_err(|error| io::Error::other(format!("map forkable guest memory: {error:?}")))
+ }
+ 
++/// Read a complete memory image into new anonymous guest RAM.
++///
++/// [`map_guest_memory_file`] maps the image `MAP_SHARED`, so the restored
++/// guest runs on the image's page cache. Transparent huge pages do not cover a
++/// file mapping, and in a nested VM, RAM mapped 4 KiB at a time stays slow.
++/// Each region here is the anonymous RAM a cold boot gets (its host address
++/// agrees with its guest address modulo 2 MiB, see `map_aligned_guest_ram`),
++/// advised for huge pages, and the image's data extents are read into it on
++/// several threads before any vCPU runs. Holes are not read and stay
++/// unallocated. Nothing refers to the image afterwards, so the next checkpoint
++/// saves this RAM as it saves a cold-booted VM's.
++#[cfg(target_os = "linux")]
++pub fn read_guest_memory_file(
++    descs: &[MemoryRegionDesc],
++    file: &File,
++) -> io::Result<GuestMemoryMmap> {
++    if descs.is_empty() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "snapshot contains no guest-memory regions",
++        ));
++    }
++    let started = std::time::Instant::now();
++    let mut regions = Vec::with_capacity(descs.len());
++    let mut work = Vec::new();
++    let mut offset = 0_u64;
++    for desc in descs {
++        let len = usize::try_from(desc.len).map_err(|_| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                "guest-memory region does not fit host address space",
++            )
++        })?;
++        if len == 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "zero-length guest-memory region",
++            ));
++        }
++        let mapping = crate::builder::map_aligned_guest_ram(GuestAddress(desc.gpa), len)
++            .map_err(io::Error::other)?;
++        let host = mapping.as_ptr() as usize;
++        // SAFETY: `host` and `len` describe the fresh mapping above; advice
++        // changes no contents. A kernel that refuses keeps 4 KiB pages.
++        if unsafe { libc::madvise(host as *mut libc::c_void, len, libc::MADV_HUGEPAGE) } != 0 {
++            debug!(
++                "guest RAM at 0x{:x}: MADV_HUGEPAGE: {}",
++                desc.gpa,
++                io::Error::last_os_error()
++            );
++        }
++        let extents = file_data_extents(file, offset, desc.len)?
++            .unwrap_or_else(|| vec![(0, desc.len)]);
++        for (start, end) in extents {
++            push_pieces(&mut work, start, end, |at, piece| PromotionPiece::Read {
++                fd: file.as_raw_fd(),
++                file_offset: offset + at,
++                destination: host + at as usize,
++                len: piece,
++            });
++        }
++        regions.push(
++            vm_memory::GuestRegionMmap::new(mapping, GuestAddress(desc.gpa))
++                .ok_or_else(|| io::Error::other("guest RAM region overflows"))?,
++        );
++        offset = offset.checked_add(desc.len).ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                "guest-memory image offset overflow",
++            )
++        })?;
++    }
++    let actual = file.metadata()?.len();
++    if offset != actual {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            format!("guest-memory image length {actual} does not match manifest {offset}"),
++        ));
++    }
++    let memory = GuestMemoryMmap::from_regions(regions)
++        .map_err(|error| io::Error::other(format!("guest memory: {error:?}")))?;
++    run_promotion_pieces(&work)?;
++    let bytes: u64 = work
++        .iter()
++        .map(|piece| match piece {
++            PromotionPiece::Read { len, .. } | PromotionPiece::Scan { len, .. } => *len,
++        })
++        .sum();
++    info!(
++        "read {bytes} bytes of guest RAM into anonymous memory in {} ms",
++        started.elapsed().as_millis()
++    );
++    Ok(memory)
++}
++
+ /// Total byte length of all regions in a descriptor list (the size of the
+ /// memory image stream).
+ pub fn memory_image_len(descs: &[MemoryRegionDesc]) -> u64 {
+@@ -6327,4 +6422,48 @@ mod tests {
+         file.read_exact_at(&mut backing, 0).unwrap();
+         assert_eq!(backing, [0x11; 16]);
+     }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn read_memory_image_is_anonymous_aligned_and_exact() {
++        use crate::builder::create_guest_ram_memfd;
++        use std::os::unix::fs::FileExt;
++
++        let descs = [
++            MemoryRegionDesc {
++                gpa: 0x1000,
++                len: 0x20_0000,
++            },
++            MemoryRegionDesc {
++                gpa: 0x40_0000,
++                len: 0x10_0000,
++            },
++        ];
++        let file = create_guest_ram_memfd(0x30_0000).expect("sparse memory image");
++        file.write_all_at(&[0xA5; 4096], 0x1000).unwrap();
++        file.write_all_at(&[0x5A; 4096], 0x20_2000).unwrap();
++
++        let memory = read_guest_memory_file(&descs, &file).expect("read memory image");
++        for (region, desc) in memory.iter().zip(&descs) {
++            assert!(region.file_offset().is_none());
++            let host = memory.get_host_address(GuestAddress(desc.gpa)).unwrap() as u64;
++            assert_eq!(host % (2 << 20), desc.gpa % (2 << 20));
++        }
++        let mut image = vec![0_u8; 0x30_0000];
++        file.read_exact_at(&mut image, 0).unwrap();
++        let mut ram = vec![0_u8; 0x20_0000];
++        memory.read_slice(&mut ram, GuestAddress(0x1000)).unwrap();
++        assert!(ram == image[..0x20_0000]);
++        let mut ram = vec![0_u8; 0x10_0000];
++        memory.read_slice(&mut ram, GuestAddress(0x40_0000)).unwrap();
++        assert!(ram == image[0x20_0000..]);
++
++        memory.write_slice(&[0x11; 16], GuestAddress(0x2000)).unwrap();
++        let mut backing = [0_u8; 16];
++        file.read_exact_at(&mut backing, 0x1000).unwrap();
++        assert_eq!(backing, [0xA5; 16], "restored RAM must not alias the image");
++
++        let short = create_guest_ram_memfd(0x20_0000).expect("short memory image");
++        assert!(read_guest_memory_file(&descs, &short).is_err());
++    }
+ }
