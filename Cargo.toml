@@ -130,6 +130,8 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
 landlock = "0.4"
+# XXH3-128 tells which blocks of a RAM base a delta save changed.
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 # Windows process management (OpenProcess / TerminateProcess / Wait) and
 # DLL-search-path control (SetDllDirectoryW). Used to replace the Unix

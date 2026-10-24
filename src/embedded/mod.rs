@@ -8,7 +8,9 @@ mod inflight;
 mod runtime;
 
 pub use crate::agent::fork::ForkSourcePolicy;
-pub use crate::portable_checkpoint::{PauseControl, PauseStage};
+pub use crate::portable_checkpoint::{
+    delta_saves_enabled, set_delta_saves, PauseControl, PauseStage, SaveMode,
+};
 pub use control::MachineSpec;
 pub use exec::{ExecCancel, ExecOptions};
 pub use runtime::{

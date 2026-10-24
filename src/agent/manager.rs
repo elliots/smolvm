@@ -2832,11 +2832,16 @@ impl AgentManager {
                         e.to_string(),
                     )
                 })?;
+                // The read-only RAM input and the RAM base stay the
+                // service's: the VMM must never write a RAM image.
                 crate::process::chown_tree_except(
                     d,
                     uid,
                     gid,
-                    Some(&d.join(crate::portable_checkpoint::READONLY_INPUT_DIR)),
+                    &[
+                        &d.join(crate::portable_checkpoint::READONLY_INPUT_DIR),
+                        &d.join(crate::portable_checkpoint::RAM_BASE_DIR),
+                    ],
                 )
                 .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
                 #[cfg(target_os = "linux")]

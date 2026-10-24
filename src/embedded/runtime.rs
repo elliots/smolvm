@@ -11,7 +11,7 @@ use crate::db::SmolvmDb;
 use crate::embedded::control::{self, MachineSpec};
 use crate::embedded::exec::{ExecCancel, ExecOptions};
 use crate::embedded::handle::VmHandle;
-use crate::portable_checkpoint::{PauseControl, PauseStage};
+use crate::portable_checkpoint::{PauseControl, PauseStage, SaveMode};
 use crate::{Error, Result};
 use smolvm_protocol::ImageInfo;
 
@@ -71,7 +71,14 @@ impl ResizeSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PauseOutcome {
     /// The checkpoint is durable and the VM process has exited.
-    Paused,
+    Paused {
+        /// How this pause saved guest RAM, or `None` when the machine was
+        /// already paused and this call saved nothing.
+        save_mode: Option<SaveMode>,
+        /// Bytes of guest RAM this pause wrote: the RAM image's allocated
+        /// bytes for a full save, the changed pages' data for a delta.
+        written_bytes: u64,
+    },
     /// The pause was cancelled before its checkpoint was durable. The VM
     /// process that ran the machine still runs it, and the machine has no
     /// checkpoint.
@@ -94,6 +101,11 @@ pub struct MachineInspection {
     pub process_alive: bool,
     /// The resume point of a pausing or paused machine.
     pub resume_point: Option<ResumePointInspection>,
+    /// Bytes the machine's RAM base takes on disk, awake or asleep; zero
+    /// without one (see [`crate::portable_checkpoint::set_delta_saves`]).
+    /// While the machine is paused, its resume point's RAM image is the same
+    /// file, so these bytes are also in the resume point's `allocated_bytes`.
+    pub base_bytes: u64,
 }
 
 /// The resume point of a pausing or paused machine.
@@ -251,6 +263,13 @@ impl EmbeddedRuntime {
     /// checkpoint: plain files that only a resume on this host can use, which
     /// it starts from without extracting or verifying an archive. Such a pause
     /// cannot be exported.
+    ///
+    /// On Linux the checkpoint's RAM image is also the machine's RAM base,
+    /// which stays on disk after the resume, and the machine's next pause
+    /// writes only the 4 KiB pages of guest RAM that changed into it (a delta
+    /// save). [`crate::portable_checkpoint::set_delta_saves`] or
+    /// `SMOLVM_DELTA_SAVES=off` turns that off: every pause then writes the
+    /// whole image and no base is kept.
     pub fn pause_machine_local(&self, name: &str) -> Result<()> {
         self.pause_machine_inner(name, None, true, None).map(drop)
     }
@@ -358,7 +377,10 @@ impl EmbeddedRuntime {
                     Error::agent("pause machine", "paused machine has no checkpoint")
                 })?;
                 crate::portable_checkpoint::verify_resume_point(path)?;
-                return Ok(PauseOutcome::Paused);
+                return Ok(PauseOutcome::Paused {
+                    save_mode: None,
+                    written_bytes: 0,
+                });
             }
             if record.paused_checkpoint.is_some() {
                 return Err(Error::agent_conflict(
@@ -412,46 +434,52 @@ impl EmbeddedRuntime {
                     publish,
                 ),
             };
-            if let Err(error) = result {
-                // Capture's guard has resumed the original on failure. Never
-                // erase the durable recovery point if the process is gone.
-                let running = record.is_process_alive()
-                    && crate::agent::fork::control_socket_cmd(
-                        &crate::agent::fork::control_socket_path(name),
-                        "STATUS",
-                    )
-                    .is_ok_and(|status| status.trim() == "OK running");
-                if running {
-                    self.db.update_vm_durable(name, |record| {
-                        if record.paused_checkpoint.as_ref() == Some(&output) {
-                            record.paused_checkpoint = None;
-                            record.state = RecordState::Running;
-                        }
-                    })?;
-                    if output.exists() {
-                        let removed = if output.is_dir() {
-                            std::fs::remove_dir_all(&output)
-                        } else {
-                            std::fs::remove_file(&output)
-                        };
-                        if let Err(cleanup) = removed {
-                            tracing::warn!(%cleanup, "could not remove failed pause artifact");
+            let captured = match result {
+                Ok(captured) => captured,
+                Err(error) => {
+                    // Capture's guard has resumed the original on failure. Never
+                    // erase the durable recovery point if the process is gone.
+                    let running = record.is_process_alive()
+                        && crate::agent::fork::control_socket_cmd(
+                            &crate::agent::fork::control_socket_path(name),
+                            "STATUS",
+                        )
+                        .is_ok_and(|status| status.trim() == "OK running");
+                    if running {
+                        self.db.update_vm_durable(name, |record| {
+                            if record.paused_checkpoint.as_ref() == Some(&output) {
+                                record.paused_checkpoint = None;
+                                record.state = RecordState::Running;
+                            }
+                        })?;
+                        if output.exists() {
+                            let removed = if output.is_dir() {
+                                std::fs::remove_dir_all(&output)
+                            } else {
+                                std::fs::remove_file(&output)
+                            };
+                            if let Err(cleanup) = removed {
+                                tracing::warn!(%cleanup, "could not remove failed pause artifact");
+                            }
                         }
                     }
+                    if running && cancel.is_some_and(PauseControl::is_cancelled) {
+                        tracing::info!(machine = name, "pause cancelled; the machine runs on");
+                        return Ok(PauseOutcome::Cancelled);
+                    }
+                    return Err(error);
                 }
-                if running && cancel.is_some_and(PauseControl::is_cancelled) {
-                    tracing::info!(machine = name, "pause cancelled; the machine runs on");
-                    return Ok(PauseOutcome::Cancelled);
-                }
-                return Err(error);
-            }
+            };
             self.remove_cached_handle(name)?;
             self.db.update_vm(name, |record| {
                 record.state = RecordState::Paused;
                 record.pid = None;
                 record.pid_start_time = None;
             })?;
-            Ok(PauseOutcome::Paused)
+            Ok(PauseOutcome::Paused {
+                save_mode: Some(captured.save_mode),
+                written_bytes: captured.written_bytes,
+            })
         })
     }
 
@@ -1785,6 +1813,9 @@ impl EmbeddedRuntime {
             }
         });
         Ok(Some(MachineInspection {
+            base_bytes: crate::portable_checkpoint::ram_base_bytes(&crate::agent::vm_data_dir(
+                name,
+            )),
             process_alive: record.is_process_alive(),
             state: record.state,
             pid: record.pid,

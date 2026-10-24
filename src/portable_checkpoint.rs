@@ -44,6 +44,12 @@ const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Directory inside an extracted artifact containing live state.
 pub const ASSET_DIR: &str = "checkpoint";
 
+#[cfg(target_os = "linux")]
+mod ram_base;
+/// The directory in a machine's data directory that holds its RAM base (see
+/// [`set_delta_saves`]).
+pub(crate) const RAM_BASE_DIR: &str = "ram-base";
+
 const INSTALLED_DIR: &str = "portable-checkpoint";
 const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
@@ -762,6 +768,52 @@ pub struct CaptureOptions {
     pub local: bool,
 }
 
+/// Whether this process's local pauses keep a RAM base and save only the
+/// pages that changed since the last pause (`None`: not set, so
+/// `SMOLVM_DELTA_SAVES` decides).
+static DELTA_SAVES: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// Turn delta saves on or off for this process's local pauses, in place of
+/// `SMOLVM_DELTA_SAVES`.
+///
+/// With delta saves on (the default), a local pause on Linux keeps the RAM
+/// image it saved as the machine's RAM base, also once the machine resumes,
+/// and the machine's next pause writes only the 4 KiB pages of guest RAM that
+/// differ from it into the base, in place. With them off, every pause writes
+/// the whole image, and a pause removes a base an earlier one kept. Set
+/// `SMOLVM_DELTA_SAVES=off` (or `0`, `false`, `no`) for the same without code.
+pub fn set_delta_saves(enabled: bool) {
+    *DELTA_SAVES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(enabled);
+}
+
+/// Whether local pauses use delta saves: see [`set_delta_saves`].
+pub fn delta_saves_enabled() -> bool {
+    if let Some(enabled) = *DELTA_SAVES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return enabled;
+    }
+    !std::env::var("SMOLVM_DELTA_SAVES").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    })
+}
+
+/// How a capture saved guest RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveMode {
+    /// The whole RAM image was written.
+    Full,
+    /// Only the pages that changed since the machine's last pause were
+    /// written, into its RAM base.
+    Delta,
+}
+
 /// The file describing a local checkpoint: a directory a pause leaves with
 /// the files the VMM saved, unpacked, so that a resume on the same host hands
 /// them to the VMM without extracting and verifying an archive. It holds the
@@ -790,7 +842,22 @@ pub struct LocalCheckpoint {
     /// The RAM image's file identity when the pause recorded it.
     pub memory: LocalFileIdentity,
     /// SHA-256 of each piece of the RAM image that holds data, in order.
+    /// Empty in version 2, which has `memory_blocks`.
     pub memory_pieces: Vec<LocalPieceDigest>,
+    /// Version 2: the SHA-256 of each block of the RAM image, the digests of
+    /// the machine's RAM base index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_blocks: Option<LocalBlockDigests>,
+}
+
+/// The SHA-256 of each `block_size` block of a RAM image, in order: lowercase
+/// hex, or empty for a block that reads as zeros.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalBlockDigests {
+    /// Bytes in a block; the last block may be shorter.
+    pub block_size: u64,
+    /// One digest per block.
+    pub sha256: Vec<String>,
 }
 
 /// The SHA-256 of `len` bytes at `offset` of a sparse file. Holes between
@@ -883,6 +950,37 @@ fn sparse_piece_digests(file: &std::fs::File) -> Result<Vec<LocalPieceDigest>> {
         .collect())
 }
 
+/// The block digests of `file`, as a version 2 record holds them.
+#[cfg(target_os = "linux")]
+fn sparse_block_digests(file: &std::fs::File, block_size: u64) -> Result<LocalBlockDigests> {
+    if block_size != ram_base::BLOCK {
+        return Err(Error::agent(
+            "read local checkpoint",
+            "unsupported RAM block size",
+        ));
+    }
+    Ok(local_block_digests(&ram_base::block_digests(file)?))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn sparse_block_digests(_: &std::fs::File, _: u64) -> Result<LocalBlockDigests> {
+    Err(Error::agent(
+        "read local checkpoint",
+        "RAM block digests are Linux-only",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn local_block_digests(blocks: &[ram_base::BlockDigest]) -> LocalBlockDigests {
+    LocalBlockDigests {
+        block_size: ram_base::BLOCK,
+        sha256: blocks
+            .iter()
+            .map(ram_base::BlockDigest::sha256_hex)
+            .collect(),
+    }
+}
+
 /// A file's identity: what changes if it is written, replaced or truncated.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalFileIdentity {
@@ -911,8 +1009,13 @@ impl LocalFileIdentity {
 }
 
 /// Write `dir`'s record and make every file and directory in it durable.
+/// With `memory_blocks`, the record is version 2 and the image is not read.
 #[cfg(unix)]
-fn seal_local_checkpoint(dir: &Path, manifest: &PackManifest) -> Result<()> {
+fn seal_local_checkpoint(
+    dir: &Path,
+    manifest: &PackManifest,
+    memory_blocks: Option<LocalBlockDigests>,
+) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(ASSET_DIR).join("memory.bin");
@@ -928,15 +1031,19 @@ fn seal_local_checkpoint(dir: &Path, manifest: &PackManifest) -> Result<()> {
         ));
     }
     let file = std::fs::File::open(&path)?;
-    let memory_pieces = sparse_piece_digests(&file)?;
+    let memory_pieces = match memory_blocks {
+        Some(_) => Vec::new(),
+        None => sparse_piece_digests(&file)?,
+    };
     let memory = file
         .metadata()
         .map_err(|e| Error::agent("seal local checkpoint", e.to_string()))?;
     let record = LocalCheckpoint {
-        version: 1,
+        version: if memory_blocks.is_some() { 2 } else { 1 },
         manifest: manifest.clone(),
         memory: LocalFileIdentity::of(&memory),
         memory_pieces,
+        memory_blocks,
     };
     let json = serde_json::to_vec(&record)
         .map_err(|e| Error::agent("seal local checkpoint", e.to_string()))?;
@@ -970,8 +1077,11 @@ pub fn read_local_checkpoint(dir: &Path) -> Result<LocalCheckpoint> {
     let record: LocalCheckpoint =
         serde_json::from_slice(&std::fs::read(dir.join(LOCAL_CHECKPOINT_MANIFEST))?)
             .map_err(|e| invalid(&e.to_string()))?;
-    if record.version != 1 {
+    if record.version != 1 && record.version != 2 {
         return Err(invalid("unknown local checkpoint version"));
+    }
+    if (record.version == 2) != record.memory_blocks.is_some() {
+        return Err(invalid("the record's RAM digests do not match its version"));
     }
     let checkpoint = record
         .manifest
@@ -989,7 +1099,11 @@ pub fn read_local_checkpoint(dir: &Path) -> Result<LocalCheckpoint> {
     // The inode the pause hashed stands in for a full read; any other is read.
     if LocalFileIdentity::of(&memory) != record.memory {
         let file = std::fs::File::open(&path)?;
-        if sparse_piece_digests(&file)? != record.memory_pieces {
+        let matches = match &record.memory_blocks {
+            None => sparse_piece_digests(&file)? == record.memory_pieces,
+            Some(blocks) => sparse_block_digests(&file, blocks.block_size)? == *blocks,
+        };
+        if !matches {
             return Err(invalid("the RAM image changed after the pause"));
         }
         tracing::info!(path = %path.display(), "local checkpoint RAM image verified by a full read");
@@ -1026,6 +1140,12 @@ pub struct CaptureResult {
     pub source_pause: std::time::Duration,
     /// Complete capture and compression time.
     pub elapsed: std::time::Duration,
+    /// How guest RAM was saved.
+    pub save_mode: SaveMode,
+    /// Bytes of guest RAM written to disk: the RAM image's allocated bytes
+    /// for a full local save, the changed pages' data for a delta, and the
+    /// artifact's size otherwise.
+    pub written_bytes: u64,
 }
 
 /// Restore a portable live checkpoint into a new stopped machine record.
@@ -1980,6 +2100,135 @@ fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tem
     runtime_capture_dir(name, vm)
 }
 
+/// What a delta save wrote into the machine's RAM base.
+#[cfg(target_os = "linux")]
+struct DeltaSaved {
+    /// The block digests of the base, which is now the pause's image.
+    blocks: Vec<ram_base::BlockDigest>,
+    written_bytes: u64,
+}
+
+/// How a delta save ended, short of an error.
+#[cfg(target_os = "linux")]
+enum DeltaOutcome {
+    Saved(DeltaSaved),
+    /// The base could not take a delta, or the VMM refused the request
+    /// before streaming, for this reason; the save the VMM prepared is still
+    /// there to finish in full.
+    Declined(String),
+}
+
+/// Finish a prepared save as a delta: send the VMM the base's page table
+/// (`FINISH_SAVE_DELTA`), write the pages it streams back into the base, and
+/// hash each block written again. The index says `applying` while pages
+/// land, and `clean` again when this returns, true for every page and block
+/// written, whether or not the stream completed. The base is durable before
+/// this returns.
+#[cfg(target_os = "linux")]
+fn finish_delta_save(
+    base: &ram_base::RamBase,
+    mut index: ram_base::RamIndex,
+    control: &Path,
+    snapshot: &Path,
+    cancel: Option<&PauseControl>,
+    max_image: u64,
+) -> Result<DeltaOutcome> {
+    use std::io::BufRead;
+    // Until the request is sent, the VMM's save is intact for a full finish.
+    let memory = match base.open_for_writing() {
+        Ok(memory) => memory,
+        Err(error) => return Ok(DeltaOutcome::Declined(error.to_string())),
+    };
+    let table = index.table();
+    let on_disk = match base.mark_applying(&mut index) {
+        Ok(on_disk) => on_disk,
+        Err(error) => return Ok(DeltaOutcome::Declined(error.to_string())),
+    };
+    let timeout = std::time::Duration::from_secs(30 * 60);
+    let mut applied = ram_base::Applied::default();
+    let streamed = (|| -> Result<Option<String>> {
+        let mut stream = match cancel {
+            Some(cancel) => cancel.connect_waiting(control, timeout)?,
+            None => {
+                let stream = crate::platform::uds::UdsStream::connect(control)
+                    .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
+                stream.set_read_timeout(Some(timeout)).ok();
+                stream
+            }
+        };
+        stream.write_all(
+            format!("FINISH_SAVE_DELTA {} {}\n", snapshot.display(), table.len()).as_bytes(),
+        )?;
+        stream.write_all(&table)?;
+        let mut reader = std::io::BufReader::with_capacity(256 << 10, stream);
+        let mut magic = [0_u8; 8];
+        reader.read_exact(&mut magic)?;
+        let read_reply = |reader: &mut std::io::BufReader<_>, start: &[u8]| -> Result<String> {
+            let mut line = start.to_vec();
+            reader.take(4096).read_until(b'\n', &mut line)?;
+            Ok(String::from_utf8_lossy(&line).trim().to_string())
+        };
+        if &magic != ram_base::STREAM_MAGIC {
+            return Ok(Some(read_reply(&mut reader, &magic)?));
+        }
+        let end = ram_base::apply_delta(&memory, &mut index, &mut reader, max_image, &mut applied)?;
+        let reply = read_reply(&mut reader, &[])?;
+        tracing::info!(command = "FINISH_SAVE_DELTA", reply = %reply, "checkpoint memory protocol reply");
+        match end {
+            ram_base::StreamEnd::Complete if reply.starts_with("OK saved delta") => Ok(None),
+            _ => Err(Error::agent("finish delta checkpoint", reply)),
+        }
+    })();
+    if let Some(cancel) = cancel {
+        cancel.end_wait();
+    }
+    if streamed.is_ok() {
+        if let Ok(layout) = ram_base::file_sha256(&snapshot.join("manifest.bin")) {
+            index.layout_sha256 = layout;
+        }
+    }
+    // Whatever happened, each entry describes what is on disk.
+    let hashing = std::time::Instant::now();
+    let rehashed = ram_base::refresh_digests(&memory, &mut index);
+    let hash_ms = hashing.elapsed().as_millis() as u64;
+    memory.sync_data()?;
+    index.state = ram_base::IndexState::Clean;
+    index.generation += 1;
+    base.update_index(&on_disk, &index)?;
+    let streamed = streamed?;
+    let rehashed = rehashed?;
+    match streamed {
+        Some(reply) => Ok(DeltaOutcome::Declined(reply)),
+        None => {
+            tracing::info!(
+                changed_blocks = applied.changed_blocks,
+                changed_pages = applied.changed_pages,
+                written_bytes = applied.written_bytes,
+                rehashed_blocks = rehashed,
+                hash_ms,
+                "delta save applied to the RAM base"
+            );
+            Ok(DeltaOutcome::Saved(DeltaSaved {
+                blocks: index.blocks,
+                written_bytes: applied.written_bytes,
+            }))
+        }
+    }
+}
+
+/// Bytes a machine's RAM base takes on disk; zero when it has none.
+pub fn ram_base_bytes(vm_data: &Path) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        ram_base::RamBase::of(vm_data).allocated_bytes()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = vm_data;
+        0
+    }
+}
+
 /// Name prefix of a capture's runtime directory in the machine's data directory.
 const RUNTIME_CAPTURE_PREFIX: &str = "checkpoint-capture-";
 
@@ -1998,6 +2247,10 @@ pub(crate) fn release_interrupted_capture(name: &str, output: Option<&Path>) {
 }
 
 fn release_interrupted_capture_in(data: &Path, control: &Path, output: Option<&Path>) {
+    // A pause that died while writing blocks into the RAM base left it half
+    // written; the next pause writes the image in full.
+    #[cfg(target_os = "linux")]
+    ram_base::RamBase::of(data).drop_if_applying();
     let remove = |path: &Path| {
         let removed = if path.is_dir() {
             std::fs::remove_dir_all(path)
@@ -2446,6 +2699,31 @@ impl PauseControl {
         crate::agent::fork::control_socket_cmd_with_timeout(control, command, timeout)
     }
 
+    /// A connection to the VMM whose reads a cancel cuts short, for a reply
+    /// longer than [`Self::command`]'s line. [`Self::end_wait`] ends that.
+    #[cfg(target_os = "linux")]
+    fn connect_waiting(
+        &self,
+        control: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<crate::platform::uds::UdsStream> {
+        self.check()?;
+        let stream = crate::platform::uds::UdsStream::connect(control)
+            .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
+        stream.set_read_timeout(Some(timeout)).ok();
+        let mut state = self.lock();
+        if state.cancelled {
+            return Err(pause_cancelled());
+        }
+        state.waiting = Some(stream.try_clone()?);
+        Ok(stream)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn end_wait(&self) {
+        self.lock().waiting = None;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, PauseControlState> {
         self.state
             .lock()
@@ -2463,6 +2741,281 @@ impl Drop for PauseFreeze<'_> {
 
 fn pause_cancelled() -> Error {
     Error::agent("pause machine", "the pause was cancelled")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod delta_save_tests {
+    use super::*;
+    use ram_base::{BlockDigest, IndexState, RamBase, RamIndex, BLOCK, PAGE as BASE_PAGE};
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    use std::time::Duration;
+
+    const PAGE: usize = 4096;
+
+    fn image(blocks: usize, extra: usize, pages: &[(usize, u8)]) -> Vec<u8> {
+        let mut image = vec![0; blocks * BLOCK as usize + extra];
+        for &(page, byte) in pages {
+            image[page * PAGE..(page + 1) * PAGE].fill(byte);
+        }
+        image
+    }
+
+    /// What a pause in full leaves: `bytes` as the sealed image, then the base.
+    fn full_pause(data: &Path, name: &str, bytes: &[u8]) -> RamIndex {
+        let image = data.join(name);
+        std::fs::write(&image, bytes).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let seed = ram_base::new_seed();
+        let hashes = ram_base::hash_image(&std::fs::File::open(&image).unwrap(), seed).unwrap();
+        let index = RamIndex::new(bytes.len() as u64, seed, [0; 32], hashes);
+        RamBase::of(data).install(&image, &index).unwrap();
+        std::fs::remove_file(&image).unwrap();
+        index
+    }
+
+    enum Vmm {
+        /// Stream the delta of this image and reply.
+        Image(Vec<u8>),
+        /// Stream this many bytes of the delta of this image, then hold.
+        Cut(Vec<u8>, usize),
+        /// Refuse the request.
+        Refuse,
+    }
+
+    /// A VMM control socket that answers one FINISH_SAVE_DELTA.
+    fn fake_vmm(dir: &Path, vmm: Vmm) -> (PathBuf, std::thread::JoinHandle<String>) {
+        let path = dir.join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0_u8];
+            while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+                line.push(byte[0]);
+            }
+            let line = String::from_utf8(line).unwrap();
+            let (command, len) = line.rsplit_once(' ').unwrap();
+            let mut table = vec![0; len.parse().unwrap()];
+            stream.read_exact(&mut table).unwrap();
+            let snapshot = PathBuf::from(command.strip_prefix("FINISH_SAVE_DELTA ").unwrap());
+            match vmm {
+                Vmm::Image(image) => {
+                    stream
+                        .write_all(&ram_base::tests::delta_stream(&image, &table))
+                        .unwrap();
+                    std::fs::write(snapshot.join("manifest.bin"), b"layout").unwrap();
+                    stream.write_all(b"OK saved delta (...)\n").unwrap();
+                }
+                Vmm::Cut(image, len) => {
+                    let delta = ram_base::tests::delta_stream(&image, &table);
+                    stream.write_all(&delta[..len]).unwrap();
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+                Vmm::Refuse => stream.write_all(b"ERR EINVAL bad table\n").unwrap(),
+            }
+            line
+        });
+        (path, worker)
+    }
+
+    fn delta_pause(data: &Path, vmm: Vmm) -> Result<DeltaOutcome> {
+        let sockets = tempfile::tempdir().unwrap();
+        let snapshot = data.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let (socket, _worker) = fake_vmm(sockets.path(), vmm);
+        let base = RamBase::of(data);
+        let index = base.usable().expect("a usable base");
+        finish_delta_save(&base, index, &socket, &snapshot, None, 1 << 40)
+    }
+
+    fn assert_base_is(data: &Path, bytes: &[u8]) {
+        let base = RamBase::of(data);
+        assert!(
+            std::fs::read(base.memory_path()).unwrap() == bytes,
+            "the base holds the image"
+        );
+        let index = base.usable().expect("the index is clean");
+        let on_disk = ram_base::hash_image(
+            &std::fs::File::open(base.memory_path()).unwrap(),
+            index.seed,
+        )
+        .unwrap();
+        assert_eq!(index.blocks, on_disk.blocks, "the index describes the base");
+        assert_eq!(index.pages, on_disk.pages, "the index describes each page");
+    }
+
+    #[test]
+    fn full_then_delta_then_full_pauses_keep_the_base_exact() {
+        let data = tempfile::tempdir().unwrap();
+        let first = image(3, PAGE, &[(0, 1), (512, 2), (1536, 3)]);
+        full_pause(data.path(), "first.bin", &first);
+        assert_base_is(data.path(), &first);
+
+        let second = image(3, PAGE, &[(512, 2), (513, 4), (1536, 3)]);
+        let DeltaOutcome::Saved(saved) =
+            delta_pause(data.path(), Vmm::Image(second.clone())).unwrap()
+        else {
+            panic!("the delta was declined");
+        };
+        assert_eq!(
+            saved.written_bytes, PAGE as u64,
+            "page 513; page 0 is punched"
+        );
+        assert_base_is(data.path(), &second);
+        let index = RamBase::of(data.path()).usable().unwrap();
+        assert_eq!(index.generation, 2, "applying, then clean");
+        assert_eq!(
+            index.layout_sha256,
+            ram_base::file_sha256(&data.path().join("snapshot/manifest.bin")).unwrap()
+        );
+        assert_eq!(saved.blocks, index.blocks);
+
+        let third = image(2, 0, &[(7, 9)]);
+        let seed = index.seed;
+        full_pause(data.path(), "third.bin", &third);
+        assert_base_is(data.path(), &third);
+        assert_ne!(
+            RamBase::of(data.path()).usable().unwrap().seed,
+            seed,
+            "a full save re-seeds"
+        );
+
+        let fourth = image(2, 0, &[(7, 9), (600, 1)]);
+        let DeltaOutcome::Saved(saved) =
+            delta_pause(data.path(), Vmm::Image(fourth.clone())).unwrap()
+        else {
+            panic!("the delta was declined");
+        };
+        assert_eq!(saved.written_bytes, PAGE as u64);
+        assert_base_is(data.path(), &fourth);
+    }
+
+    #[test]
+    fn a_refused_delta_leaves_the_base_clean_and_unchanged() {
+        let data = tempfile::tempdir().unwrap();
+        let first = image(2, 0, &[(0, 1)]);
+        full_pause(data.path(), "first.bin", &first);
+        let outcome = delta_pause(data.path(), Vmm::Refuse).unwrap();
+        assert!(
+            matches!(outcome, DeltaOutcome::Declined(reply) if reply == "ERR EINVAL bad table")
+        );
+        assert_base_is(data.path(), &first);
+    }
+
+    #[test]
+    fn a_cancel_during_the_stream_leaves_a_consistent_base() {
+        let data = tempfile::tempdir().unwrap();
+        let first = image(4, 0, &[(0, 1), (512, 2), (1024, 3), (1536, 4)]);
+        full_pause(data.path(), "first.bin", &first);
+        let second = image(4, 0, &[(0, 11), (512, 12), (1024, 13), (1536, 14)]);
+        let sockets = tempfile::tempdir().unwrap();
+        let snapshot = data.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        // The header, one whole frame of one page and part of the next.
+        let frame = 1 + 8 + 2 * 64 + BASE_PAGE as usize;
+        let cut = 40 + frame + 1000;
+        let (socket, _worker) = fake_vmm(sockets.path(), Vmm::Cut(second.clone(), cut));
+        let control = PauseControl::new();
+        let canceller = std::thread::spawn({
+            let control = control.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(control.cancel());
+            }
+        });
+        let base = RamBase::of(data.path());
+        let index = base.usable().unwrap();
+        let started = std::time::Instant::now();
+        let result = finish_delta_save(&base, index, &socket, &snapshot, Some(&control), 1 << 40);
+        canceller.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cancel cut the wait short"
+        );
+        let index = base.usable().expect("the index is clean again");
+        assert_eq!(index.state, IndexState::Clean);
+        let on_disk = ram_base::hash_image(
+            &std::fs::File::open(base.memory_path()).unwrap(),
+            index.seed,
+        )
+        .unwrap();
+        assert_eq!(
+            index.blocks, on_disk.blocks,
+            "a mix of two moments, but true"
+        );
+        assert_eq!(index.pages, on_disk.pages);
+        let disk = std::fs::read(base.memory_path()).unwrap();
+        let block = BLOCK as usize;
+        assert!(
+            disk[..block] == second[..block],
+            "the block that arrived was written"
+        );
+        assert!(disk[block..] == first[block..], "the rest is the old image");
+    }
+
+    #[test]
+    fn an_interrupted_pause_drops_a_base_left_applying() {
+        let data = tempfile::tempdir().unwrap();
+        let mut index = full_pause(data.path(), "first.bin", &image(1, 0, &[(0, 1)]));
+        index.state = IndexState::Applying;
+        RamBase::of(data.path()).write_index(&index).unwrap();
+        let sockets = tempfile::tempdir().unwrap();
+        release_interrupted_capture_in(data.path(), &sockets.path().join("none.sock"), None);
+        assert!(!data.path().join(RAM_BASE_DIR).exists());
+        assert!(RamBase::of(data.path()).usable().is_none());
+    }
+
+    #[test]
+    fn a_version_2_checkpoint_refuses_a_ram_image_changed_after_the_pause() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pause-1.local.smolcheckpoint");
+        std::fs::create_dir_all(dir.join(ASSET_DIR)).unwrap();
+        let memory = dir.join(ASSET_DIR).join("memory.bin");
+        let bytes = image(1, PAGE, &[(3, 7), (512, 8)]);
+        std::fs::write(&memory, &bytes).unwrap();
+        let mut manifest = PackManifest::new(
+            "vm://local-test".into(),
+            "none".into(),
+            "linux/arm64".into(),
+            "linux/arm64".into(),
+        );
+        let mut checkpoint = tests::minimal_checkpoint_manifest();
+        checkpoint.memory.size = bytes.len() as u64;
+        manifest.checkpoint = Some(checkpoint);
+        let hashes = ram_base::hash_image(&std::fs::File::open(&memory).unwrap(), 5).unwrap();
+        assert!(hashes
+            .blocks
+            .iter()
+            .all(|block| *block != BlockDigest::Unknown));
+        match seal_local_checkpoint(&dir, &manifest, Some(local_block_digests(&hashes.blocks))) {
+            Ok(()) => {}
+            // Only a file system with user xattrs keeps a local checkpoint.
+            Err(error) if error.to_string().contains("cannot tag") => return,
+            Err(error) => panic!("{error}"),
+        }
+        let record = read_local_checkpoint(&dir).unwrap();
+        assert_eq!(record.version, 2);
+        assert!(record.memory_pieces.is_empty());
+        assert_eq!(record.memory_blocks.as_ref().unwrap().sha256.len(), 2);
+        // Another inode with the same bytes passes a full read.
+        std::thread::sleep(Duration::from_millis(20));
+        let copy = temp.path().join("copy.bin");
+        std::fs::copy(&memory, &copy).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::rename(&copy, &memory).unwrap();
+        read_local_checkpoint(&dir).unwrap();
+        // A changed byte in either block is found.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&memory)
+            .unwrap()
+            .write_all_at(b"G", BLOCK + 10)
+            .unwrap();
+        let error = read_local_checkpoint(&dir).unwrap_err().to_string();
+        assert!(error.contains("changed after the pause"), "{error}");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -3107,6 +3660,24 @@ fn capture_with_completion(
     }
 
     let mut stored = stored;
+    // A local pause keeps the machine's last RAM image as its base, and writes
+    // only the pages that changed into it when the base and the VMM allow.
+    #[cfg(target_os = "linux")]
+    let local_ram_base = (options.local && stop_after_capture && stored.is_none())
+        .then(|| ram_base::RamBase::of(&crate::agent::vm_data_dir(name)));
+    #[cfg(target_os = "linux")]
+    let delta_base = match &local_ram_base {
+        Some(base) if delta_saves_enabled() && prepared && streamed_memory.is_none() => base
+            .usable()
+            .filter(|_| {
+                crate::agent::fork::control_socket_cmd(&pause.control, "SAVE_DELTA_CAPABILITIES")
+                    .is_ok_and(|reply| reply.trim() == "OK delta-v2")
+            })
+            .map(|index| (base, index)),
+        _ => None,
+    };
+    #[cfg(target_os = "linux")]
+    let mut delta_saved: Option<DeltaSaved> = None;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
         if let Some(stream) = streamed_memory.as_mut() {
             let memory = writer
@@ -3157,7 +3728,44 @@ fn capture_with_completion(
             )
         }
     } else {
-        if prepared && streamed_memory.is_none() {
+        #[cfg(target_os = "linux")]
+        if let Some((base, index)) = delta_base {
+            match finish_delta_save(
+                base,
+                index,
+                &pause.control,
+                &runtime_snapshot,
+                cancel,
+                max_memory_image,
+            ) {
+                Ok(DeltaOutcome::Saved(saved)) => {
+                    pause.prepared_save = None;
+                    delta_saved = Some(saved);
+                }
+                Ok(DeltaOutcome::Declined(reply)) => {
+                    tracing::warn!(machine = name, %reply, "the VMM declined a delta save; saving in full");
+                }
+                Err(error) => {
+                    // The VMM's save ends once it sees the stream closed, or
+                    // the guest resumed; until then the next capture waits.
+                    let held = (
+                        runtime_capture,
+                        memory_reservation.take(),
+                        source_lock.take(),
+                    );
+                    release_after_save(&pause.control, &runtime_snapshot, held);
+                    if cancel.is_some_and(PauseControl::is_cancelled) {
+                        return Err(pause_cancelled());
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let saved_delta = delta_saved.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let saved_delta = false;
+        if prepared && streamed_memory.is_none() && !saved_delta {
             let finish = format!("FINISH_SAVE {}", runtime_snapshot.display());
             let timeout = std::time::Duration::from_secs(30 * 60);
             let reply = match cancel {
@@ -3215,6 +3823,15 @@ fn capture_with_completion(
             };
             std::fs::write(snapshot_dir.join(file), bytes)
                 .map_err(|e| Error::agent("stage streamed checkpoint metadata", e.to_string()))?;
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(base), true) = (
+            &local_ram_base,
+            file == "memory.bin" && delta_saved.is_some(),
+        ) {
+            std::fs::hard_link(base.memory_path(), snapshot_dir.join(file))
+                .map_err(|e| Error::agent("stage RAM base", e.to_string()))?;
             continue;
         }
         if file == "memory.bin"
@@ -3379,13 +3996,69 @@ fn capture_with_completion(
         if let Some(deferred) = deferred_backings {
             deferred.stage_copies()?;
         }
-        seal_local_checkpoint(&staging_dir, &manifest)?;
+        // A delta's blocks are the base's index; a full image is hashed into
+        // a new index, in the pass that also yields its digests.
+        #[cfg(target_os = "linux")]
+        let (save_mode, new_base, memory_blocks) = match (&local_ram_base, delta_saved) {
+            (Some(_), Some(saved)) => {
+                let digests = local_block_digests(&saved.blocks);
+                (
+                    (SaveMode::Delta, Some(saved.written_bytes)),
+                    None,
+                    Some(digests),
+                )
+            }
+            (Some(_), None) if delta_saves_enabled() => {
+                let seed = ram_base::new_seed();
+                let staged = staging_dir.join(ASSET_DIR).join("memory.bin");
+                let hashes = ram_base::hash_image(&std::fs::File::open(&staged)?, seed)?;
+                let digests = local_block_digests(&hashes.blocks);
+                ((SaveMode::Full, None), Some((seed, hashes)), Some(digests))
+            }
+            (Some(base), None) => {
+                base.remove();
+                ((SaveMode::Full, None), None, None)
+            }
+            _ => ((SaveMode::Full, None), None, None),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (save_mode, memory_blocks) = ((SaveMode::Full, None::<u64>), None);
+        let (save_mode, delta_bytes) = save_mode;
+        log_phase(name, "capture_hash_memory", &mut phase);
+        seal_local_checkpoint(&staging_dir, &manifest, memory_blocks)?;
         check_cancel()?;
         std::fs::rename(&staging_dir, output)
             .map_err(|e| Error::agent("publish local checkpoint", e.to_string()))?;
         if let Some(parent) = output.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
+        let image = output.join(ASSET_DIR).join("memory.bin");
+        let written_bytes = delta_bytes.unwrap_or_else(|| {
+            std::fs::metadata(&image).map_or(0, |metadata| allocated_bytes(&metadata))
+        });
+        #[cfg(target_os = "linux")]
+        if let (Some(base), Some((seed, hashes))) = (&local_ram_base, new_base) {
+            let installed = std::fs::metadata(&image)
+                .map_err(Error::from)
+                .and_then(|metadata| {
+                    let layout =
+                        ram_base::file_sha256(&output.join(ASSET_DIR).join("manifest.bin"))?;
+                    base.install(
+                        &image,
+                        &ram_base::RamIndex::new(metadata.len(), seed, layout, hashes),
+                    )
+                });
+            if let Err(error) = installed {
+                tracing::warn!(machine = name, %error, "the pause's RAM image did not become the machine's RAM base");
+                base.remove();
+            }
+        }
+        tracing::info!(
+            machine = name,
+            ?save_mode,
+            written_bytes,
+            "local checkpoint RAM saved"
+        );
         log_phase(name, "capture_local", &mut phase);
         cancel.map_or(Ok(()), PauseControl::commit)?;
         if let Some(pins) = &pins {
@@ -3404,6 +4077,8 @@ fn capture_with_completion(
             size_bytes: 0,
             source_pause: pause_started.elapsed(),
             elapsed: started.elapsed(),
+            save_mode,
+            written_bytes,
         });
     }
 
@@ -3503,6 +4178,8 @@ fn capture_with_completion(
                 source_pause
             },
             elapsed: started.elapsed(),
+            save_mode: SaveMode::Full,
+            written_bytes: stats.new_bytes,
         });
     }
 
@@ -3619,6 +4296,8 @@ fn capture_with_completion(
             source_pause
         },
         elapsed: started.elapsed(),
+        save_mode: SaveMode::Full,
+        written_bytes: info.total_size,
     })
 }
 
@@ -8036,8 +8715,7 @@ mod tests {
         std::fs::write(source.path(), b"immutable RAM").unwrap();
         let input = retained.join("memory.bin");
         std::fs::hard_link(source.path(), &input).unwrap();
-        crate::process::chown_tree_except(machine.path(), 2000000, 2000000, Some(&retained))
-            .unwrap();
+        crate::process::chown_tree_except(machine.path(), 2000000, 2000000, &[&retained]).unwrap();
         assert_eq!(std::fs::metadata(&retained).unwrap().uid(), 0);
         assert_eq!(std::fs::metadata(&input).unwrap().uid(), 0);
         let opened = open_readonly_memory(machine.path()).unwrap();
@@ -8073,7 +8751,7 @@ mod tests {
         let mut checkpoint = minimal_checkpoint_manifest();
         checkpoint.memory.size = 9;
         manifest.checkpoint = Some(checkpoint);
-        match seal_local_checkpoint(&dir, &manifest) {
+        match seal_local_checkpoint(&dir, &manifest, None) {
             Ok(()) => {}
             // Only a file system with user xattrs keeps a local checkpoint.
             Err(error) if error.to_string().contains("cannot tag") => return,
@@ -9944,7 +10622,7 @@ mod tests {
     }
 
     /// The smallest manifest this host accepts, for tests of the validator.
-    fn minimal_checkpoint_manifest() -> PortableCheckpointManifest {
+    pub(super) fn minimal_checkpoint_manifest() -> PortableCheckpointManifest {
         PortableCheckpointManifest {
             host_mounts: Vec::new(),
             version: FORMAT_VERSION,

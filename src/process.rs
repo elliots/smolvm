@@ -1887,7 +1887,7 @@ pub fn ensure_traversable(_dir: &std::path::Path) {}
 /// its VMM will drop to. Linux-only; the caller is root.
 #[cfg(target_os = "linux")]
 pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    chown_tree_except(path, uid, gid, None)
+    chown_tree_except(path, uid, gid, &[])
 }
 
 #[cfg(target_os = "linux")]
@@ -1926,9 +1926,9 @@ pub(crate) fn chown_tree_except(
     path: &std::path::Path,
     uid: u32,
     gid: u32,
-    excluded: Option<&std::path::Path>,
+    excluded: &[&std::path::Path],
 ) -> std::io::Result<()> {
-    if excluded == Some(path) {
+    if excluded.contains(&path) {
         return Ok(());
     }
     use std::os::unix::fs::MetadataExt;
@@ -1985,7 +1985,7 @@ pub(crate) fn chown_tree_except(
     _: &std::path::Path,
     _: u32,
     _: u32,
-    _: Option<&std::path::Path>,
+    _: &[&std::path::Path],
 ) -> std::io::Result<()> {
     Ok(())
 }
