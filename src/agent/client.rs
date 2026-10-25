@@ -2191,7 +2191,21 @@ impl AgentClient {
     /// stepped. Agents without [`smolvm_protocol::SET_CLOCK_CAPABILITY`]
     /// reject the request.
     pub fn set_clock(&mut self, host_realtime_ns: u64) -> Result<ClockStep> {
-        let resp = self.request(&AgentRequest::SetClock { host_realtime_ns })?;
+        let resp = self.request(&AgentRequest::SetClock {
+            host_realtime_ns,
+            exact: false,
+        })?;
+        expect_data(resp, "set clock")
+    }
+
+    /// Step the guest's wall clock to `host_realtime_ns` whenever it is more
+    /// than 1 ms off, either way. An agent that predates it applies the
+    /// thresholds of [`Self::set_clock`].
+    pub fn set_clock_exact(&mut self, host_realtime_ns: u64) -> Result<ClockStep> {
+        let resp = self.request(&AgentRequest::SetClock {
+            host_realtime_ns,
+            exact: true,
+        })?;
         expect_data(resp, "set clock")
     }
 

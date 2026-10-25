@@ -172,6 +172,18 @@ fn raise_kernel_limits() {
     }
 }
 
+/// A restored guest's clocks move on by the time it was saved for, as its
+/// host's do, so RCU then sees one grace period as long as that and prints a
+/// stall warning with every CPU's stack. A stall in a guest is its host's
+/// scheduling, not the guest's fault, so the warnings are off.
+#[cfg(target_os = "linux")]
+fn quiet_rcu_stall_warnings() {
+    let path = "/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress";
+    if let Err(error) = std::fs::write(path, "1") {
+        boot_log("WARN", &format!("turn off RCU stall warnings ({path}): {error}"));
+    }
+}
+
 fn raise_nofile_limit() {
     let desired = libc::rlimit {
         rlim_cur: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
@@ -373,6 +385,8 @@ fn main() {
     delegate_root_cgroup_controllers();
     #[cfg(target_os = "linux")]
     raise_kernel_limits();
+    #[cfg(target_os = "linux")]
+    quiet_rcu_stall_warnings();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
@@ -2595,7 +2609,10 @@ fn handle_request(
         AgentRequest::ListAttachedMounts => AgentResponse::Ok {
             data: serde_json::to_value(attach::list()).ok(),
         },
-        AgentRequest::SetClock { host_realtime_ns } => handle_set_clock(host_realtime_ns),
+        AgentRequest::SetClock {
+            host_realtime_ns,
+            exact,
+        } => handle_set_clock(host_realtime_ns, exact),
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();
@@ -7950,10 +7967,10 @@ fn handle_memory_status() -> AgentResponse {
     AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
 }
 
-fn handle_set_clock(host_realtime_ns: u64) -> AgentResponse {
+fn handle_set_clock(host_realtime_ns: u64, exact: bool) -> AgentResponse {
     #[cfg(target_os = "linux")]
     return AgentResponse::from_result(
-        timesync::set_clock(host_realtime_ns),
+        timesync::set_clock(host_realtime_ns, exact),
         error_codes::INTERNAL_ERROR,
     );
     #[cfg(not(target_os = "linux"))]

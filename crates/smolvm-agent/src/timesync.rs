@@ -89,17 +89,30 @@ const MAX_BEHIND_NS: i64 = 50_000_000;
 /// A guest further ahead of the host than this is stepped by [`set_clock`].
 const MAX_AHEAD_NS: i64 = 5_000_000_000;
 
+/// With `exact`, a guest further off than this, either way, is stepped.
+const MAX_EXACT_SKEW_NS: i64 = 1_000_000;
+
 /// Step the wall clock to the host's `host_ns` when the guest is more than
 /// 50 ms behind it or more than 5 s ahead. Small forward drift is left to the
 /// guest, so that a host whose timestamp is a little stale never moves the
-/// clock back.
-pub fn set_clock(host_ns: u64) -> std::io::Result<smolvm_protocol::ClockStep> {
+/// clock back. With `exact`, step it whenever it is more than 1 ms off, as a
+/// host does right after a boot.
+pub fn set_clock(host_ns: u64, exact: bool) -> std::io::Result<smolvm_protocol::ClockStep> {
     let skew_ns = skew_ns(current_realtime_ns(), host_ns);
-    let stepped = !(-MAX_BEHIND_NS..=MAX_AHEAD_NS).contains(&skew_ns);
+    let stepped = steps(skew_ns, exact);
     if stepped {
         set_realtime_ns(host_ns)?;
     }
     Ok(smolvm_protocol::ClockStep { skew_ns, stepped })
+}
+
+/// Whether [`set_clock`] steps a guest `skew_ns` off the host.
+fn steps(skew_ns: i64, exact: bool) -> bool {
+    if exact {
+        skew_ns.unsigned_abs() > MAX_EXACT_SKEW_NS as u64
+    } else {
+        !(-MAX_BEHIND_NS..=MAX_AHEAD_NS).contains(&skew_ns)
+    }
 }
 
 fn skew_ns(guest_ns: u64, host_ns: u64) -> i64 {
@@ -140,18 +153,30 @@ mod tests {
         assert_eq!(skew_ns(0, u64::MAX), i64::MIN);
     }
 
+    #[test]
+    fn exact_steps_any_skew_over_a_millisecond_either_way() {
+        assert!(!steps(1_000_000, true));
+        assert!(!steps(-1_000_000, true));
+        assert!(steps(1_000_001, true));
+        assert!(steps(-1_000_001, true));
+        assert!(steps(400_000_000, true), "a guest ahead is stepped back");
+        assert!(!steps(400_000_000, false), "without exact a guest ahead is left");
+        assert!(steps(-60_000_000, false));
+        assert!(steps(i64::MIN, true));
+    }
+
     // A host time inside the gate never steps the clock, so this needs no
     // CAP_SYS_TIME.
     #[test]
     fn a_clock_inside_the_gate_is_left_alone() {
         let now = current_realtime_ns();
-        let behind = set_clock(now + 40_000_000).unwrap();
+        let behind = set_clock(now + 40_000_000, false).unwrap();
         assert!(!behind.stepped, "{behind:?}");
         assert!(
             behind.skew_ns < 0 && behind.skew_ns >= -MAX_BEHIND_NS,
             "{behind:?}"
         );
-        let ahead = set_clock(now - 4_000_000_000).unwrap();
+        let ahead = set_clock(now - 4_000_000_000, false).unwrap();
         assert!(!ahead.stepped, "{ahead:?}");
         assert!(ahead.skew_ns > 3_900_000_000, "{ahead:?}");
     }

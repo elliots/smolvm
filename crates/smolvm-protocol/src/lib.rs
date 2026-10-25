@@ -743,12 +743,17 @@ pub enum AgentRequest {
     MemoryStatus,
 
     /// Step the guest's wall clock to the host's when the guest is more than
-    /// 50 ms behind it or more than 5 s ahead, and leave it alone otherwise.
-    /// A host sends this after a resume, before the guest serves anything.
-    /// The agent answers with a [`ClockStep`].
+    /// 50 ms behind it or more than 5 s ahead, and leave it alone otherwise;
+    /// with `exact`, whenever it is more than 1 ms off either way. A host
+    /// sends this after a boot, with `exact`, and after a resume. The agent
+    /// answers with a [`ClockStep`].
     SetClock {
         /// The host's `CLOCK_REALTIME`, in nanoseconds since the Unix epoch.
         host_realtime_ns: u64,
+        /// Step any skew over 1 ms. An agent without it applies the
+        /// thresholds above.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exact: bool,
     },
 
     /// Test network connectivity directly from the agent (not via chroot).
@@ -2216,6 +2221,7 @@ mod tests {
     fn set_clock_wire_format() {
         let request = AgentRequest::SetClock {
             host_realtime_ns: 1_760_000_000_123_456_789,
+            exact: false,
         };
         let wire = serde_json::to_string(&request).unwrap();
         assert_eq!(

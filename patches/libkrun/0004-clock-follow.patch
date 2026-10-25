@@ -1,0 +1,252 @@
+From b3b2f5f781b21897774de62fa10741e599032598 Mon Sep 17 00:00:00 2001
+From: Elliot Shepherd <elliot@jarofworms.com>
+Date: Sun, 25 Oct 2026 15:02:59 +1100
+Subject: [PATCH] Let an arm64 guest's clocks follow the host's across a
+ restore or a pause, as x86 kvmclock does
+
+---
+ src/vmm/src/lib.rs          |  11 ++++
+ src/vmm/src/linux/vstate.rs | 122 +++++++++++++++++++++++++++++++-----
+ 2 files changed, 116 insertions(+), 17 deletions(-)
+
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 591f732..3c7c05b 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -1175,6 +1175,17 @@ impl Vmm {
+         }
+         self.restore_activate_devices(&checkpoint.devices)
+             .map_err(Error::Snapshot)?;
++        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
++        {
++            let followed: Vec<u64> = checkpoint
++                .vcpu_states
++                .iter_mut()
++                .filter_map(vstate::VcpuState::follow_host_time)
++                .collect();
++            if let Some(ns) = followed.iter().max() {
++                info!("guest clock moved on {} ms to the host's time", ns / 1_000_000);
++            }
++        }
+         self.restore_vcpu_states(checkpoint.vcpu_states)?;
+         // Re-arm the one-shot PIT only after vCPU state is restored. An IRQ
+         // delivered earlier can be overwritten by WHP's register restore,
+diff --git a/src/vmm/src/linux/vstate.rs b/src/vmm/src/linux/vstate.rs
+index 1462e42..9eea7da 100644
+--- a/src/vmm/src/linux/vstate.rs
++++ b/src/vmm/src/linux/vstate.rs
+@@ -2067,11 +2067,12 @@ pub struct Vcpu {
+     #[cfg(target_arch = "aarch64")]
+     mpidr: u64,
+     /// The guest virtual counter (`CNTVCT`) captured when this vCPU paused,
+-    /// written back at resume so guest time freezes across the pause. `None`
++    /// with the host's wall clock then, so that resume writes it back moved
++    /// on by the time since and the guest's clocks keep the host's time. `None`
+     /// for a vCPU that entered the paused state without running first (a fork
+     /// clone's initial state — its counter comes from the checkpoint restore).
+     #[cfg(target_arch = "aarch64")]
+-    paused_cntvct: Option<u64>,
++    paused_cntvct: Option<(u64, u64)>,
+ 
+     // The receiving end of events channel owned by the vcpu side.
+     event_receiver: Receiver<VcpuEvent>,
+@@ -2737,6 +2738,7 @@ impl Vcpu {
+             .get_reg_list(&mut reg_list)
+             .map_err(Error::VcpuGetRegList)?;
+         let mut regs = Vec::with_capacity(reg_list.as_slice().len());
++        let mut counter_anchor_ns = None;
+         for &id in reg_list.as_slice() {
+             if is_host_cache_descriptor(id) {
+                 continue;
+@@ -2752,9 +2754,16 @@ impl Vcpu {
+             self.fd
+                 .get_one_reg(id, &mut data[..size])
+                 .map_err(|e| Error::VcpuGetOneReg(id, e))?;
++            if id == KVM_REG_ARM_TIMER_CNT_ID {
++                counter_anchor_ns = Some(realtime_now_ns());
++            }
+             regs.push((id, u128::from_le_bytes(data)));
+         }
+-        Ok(VcpuState { mp_state, regs })
++        Ok(VcpuState {
++            mp_state,
++            regs,
++            counter_anchor_ns,
++        })
+     }
+ 
+     /// Restore aarch64 vCPU state captured by [`Self::save_state`] onto this
+@@ -3026,15 +3035,14 @@ impl Vcpu {
+         match self.event_receiver.try_recv() {
+             // Running ---- Pause ----> Paused
+             Ok(VcpuEvent::Pause) => {
+-                // Capture the guest's virtual counter so resume can freeze
+-                // guest time across the pause. Best-effort: a capture failure
+-                // only costs freeze semantics (the guest sees time jump),
+-                // never the pause itself.
++                // Capture the guest's virtual counter so resume can set it
++                // to the time since. Best-effort: a capture failure leaves
++                // the counter running, which shows the guest the same time.
+                 #[cfg(target_arch = "aarch64")]
+                 {
+                     self.paused_cntvct =
+                         match arch::aarch64::regs::read_virtual_timer_count(&self.fd) {
+-                            Ok(cnt) => Some(cnt),
++                            Ok(cnt) => Some((cnt, realtime_now_ns())),
+                             Err(e) => {
+                                 warn!("could not capture the virtual counter at pause: {e:?}");
+                                 None
+@@ -3078,12 +3086,13 @@ impl Vcpu {
+             // Paused ---- Resume ----> Running
+             Ok(VcpuEvent::Resume { paused_ns }) => {
+                 // x86_64: a failed kvmclock adjustment leaves the guest clock
+-                // undefined, so treat it as fatal as before. aarch64: writing
+-                // the pause-time counter back is freeze-semantics best-effort —
+-                // a failure means the guest sees the paused wall time elapse,
+-                // which is strictly better than killing the vCPU (a fork
+-                // rollback resumes through here; a fatal exit here is what
+-                // turned one failed fork into a dead golden on arm KVM hosts).
++                // undefined, so treat it as fatal as before. aarch64: the
++                // pause-time counter, moved on by the time paused, is written
++                // back best-effort: a failure leaves a rollback's counter as
++                // the checkpoint had it, which is strictly better than killing
++                // the vCPU (a fork rollback resumes through here; a fatal exit
++                // here is what turned one failed fork into a dead golden on
++                // arm KVM hosts).
+                 #[cfg(target_arch = "x86_64")]
+                 if let Err(e) = self.adjust_guest_clock_after_pause(paused_ns) {
+                     error!("failed to adjust guest clock after pause: {e}");
+@@ -3092,9 +3101,11 @@ impl Vcpu {
+                 #[cfg(target_arch = "aarch64")]
+                 {
+                     let _ = paused_ns;
+-                    if let Some(cnt) = self.paused_cntvct.take()
+-                        && let Err(e) =
+-                            arch::aarch64::regs::write_virtual_timer_count(&self.fd, cnt)
++                    if let Some((cnt, at)) = self.paused_cntvct.take()
++                        && let Err(e) = arch::aarch64::regs::write_virtual_timer_count(
++                            &self.fd,
++                            cnt.wrapping_add(counter_ticks(realtime_now_ns().saturating_sub(at))),
++                        )
+                     {
+                         warn!("could not restore the virtual counter at resume: {e:?}");
+                     }
+@@ -3429,6 +3440,30 @@ fn is_host_cache_descriptor(id: u64) -> bool {
+ pub struct VcpuState {
+     mp_state: kvm_mp_state,
+     regs: Vec<(u64, u128)>,
++    /// The host's `CLOCK_REALTIME`, in ns, when the virtual counter in
++    /// `regs` was read; `None` for state from another hypervisor.
++    counter_anchor_ns: Option<u64>,
++}
++
++/// `KVM_REG_ARM_TIMER_CNT`, the guest's virtual counter, as a register id.
++#[cfg(target_arch = "aarch64")]
++const KVM_REG_ARM_TIMER_CNT_ID: u64 = 0x6030_0000_0013_df1a;
++
++/// The host's `CLOCK_REALTIME` in ns.
++#[cfg(target_arch = "aarch64")]
++fn realtime_now_ns() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |elapsed| elapsed.as_nanos() as u64)
++}
++
++/// `ns` as ticks of the generic timer, whose frequency the guest sees too.
++#[cfg(target_arch = "aarch64")]
++pub(crate) fn counter_ticks(ns: u64) -> u64 {
++    let frequency: u64;
++    // SAFETY: CNTFRQ_EL0 is readable at EL0 and reading it has no effect.
++    unsafe { std::arch::asm!("mrs {0}, cntfrq_el0", out(reg) frequency) };
++    (u128::from(ns) * u128::from(frequency) / 1_000_000_000) as u64
+ }
+ 
+ #[cfg(target_arch = "aarch64")]
+@@ -3438,7 +3473,25 @@ impl VcpuState {
+         VcpuState {
+             mp_state: kvm_mp_state { mp_state },
+             regs,
++            counter_anchor_ns: None,
++        }
++    }
++
++    /// Moves the saved virtual counter on by the host time since it was
++    /// read, so that the restored guest's monotonic and wall clocks show the
++    /// time gone by, as an x86 guest's kvmclock does. Returns the time it
++    /// added, in ns, or `None` for state without an anchor.
++    pub fn follow_host_time(&mut self) -> Option<u64> {
++        let anchor = self.counter_anchor_ns?;
++        let ns = realtime_now_ns().saturating_sub(anchor);
++        let ticks = counter_ticks(ns);
++        for (id, value) in &mut self.regs {
++            if *id == KVM_REG_ARM_TIMER_CNT_ID {
++                *value = value.wrapping_add(u128::from(ticks));
++            }
+         }
++        self.counter_anchor_ns = Some(anchor + ns);
++        Some(ns)
+     }
+ 
+     /// Serialize the full vCPU register state to a self-describing byte blob
+@@ -3451,6 +3504,11 @@ impl VcpuState {
+             out.extend_from_slice(&id.to_le_bytes());
+             out.extend_from_slice(&val.to_le_bytes());
+         }
++        // A trailer that older blobs lack: the counter's anchor.
++        if let Some(anchor) = self.counter_anchor_ns {
++            out.push(1);
++            out.extend_from_slice(&anchor.to_le_bytes());
++        }
+         out
+     }
+ 
+@@ -3471,9 +3529,15 @@ impl VcpuState {
+             let val = u128::from_le_bytes(take(&mut pos, 16)?.try_into().unwrap());
+             regs.push((id, val));
+         }
++        let counter_anchor_ns = match bytes.get(pos) {
++            None => None,
++            Some(1) => Some(u64::from_le_bytes(take(&mut pos, 9)?[1..].try_into().unwrap())),
++            Some(tag) => return Err(format!("unknown aarch64 VcpuState trailer {tag}")),
++        };
+         Ok(VcpuState {
+             mp_state: kvm_mp_state { mp_state: mp },
+             regs,
++            counter_anchor_ns,
+         })
+     }
+ }
+@@ -3572,6 +3636,30 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[cfg(target_arch = "aarch64")]
++    #[test]
++    fn aarch64_vcpu_state_carries_its_counter_anchor() {
++        let anchor = realtime_now_ns() - 2_000_000_000;
++        let mut state = VcpuState {
++            mp_state: kvm_mp_state { mp_state: 0 },
++            regs: vec![(KVM_REG_ARM_TIMER_CNT_ID, 1_000)],
++            counter_anchor_ns: Some(anchor),
++        };
++        let back = VcpuState::deserialize(&state.serialize()).unwrap();
++        assert_eq!(back.counter_anchor_ns, Some(anchor));
++        assert_eq!(back.regs, state.regs);
++
++        let ns = state.follow_host_time().unwrap();
++        assert!((2_000_000_000..3_000_000_000).contains(&ns), "followed {ns} ns");
++        assert_eq!(state.regs[0].1, 1_000 + u128::from(counter_ticks(ns)));
++
++        let mut old = VcpuState::imported(0, vec![(KVM_REG_ARM_TIMER_CNT_ID, 1_000)]);
++        let old_blob = old.serialize();
++        assert_eq!(VcpuState::deserialize(&old_blob).unwrap().counter_anchor_ns, None);
++        assert_eq!(old.follow_host_time(), None);
++        assert_eq!(old.regs[0].1, 1_000);
++    }
++
+     #[cfg(target_arch = "x86_64")]
+     #[test]
+     fn resume_cpu_with_disabled_pvclock() {
+-- 
+2.50.1 (Apple Git-155)
+

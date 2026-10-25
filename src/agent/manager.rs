@@ -2445,6 +2445,7 @@ impl AgentManager {
         // Wait for the agent to be ready
         match self.wait_for_ready() {
             Ok(_) => {
+                self.set_boot_clock();
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
                 let boot_secs = boot_start.elapsed().as_secs_f64();
@@ -3767,6 +3768,30 @@ impl AgentManager {
 
     /// Wait for the agent to be ready.
     ///
+    /// Steps a booted guest's wall clock to the host's. A guest boots with
+    /// the time of its RTC, which counts whole seconds, so it starts up to a
+    /// second off; a resumed one keeps the clock it was saved with, which its
+    /// hypervisor moves on by the time since. Best effort: an agent that
+    /// cannot set the clock leaves it as it is.
+    fn set_boot_clock(&self) {
+        if self.inner.lock().is_clone {
+            return;
+        }
+        let host_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        match super::AgentClient::connect_with_clone_ready_timeout(&self.vsock_socket)
+            .and_then(|mut client| client.set_clock_exact(host_ns))
+        {
+            Ok(step) => tracing::info!(
+                skew_ms = step.skew_ns as f64 / 1e6,
+                stepped = step.stepped,
+                "guest clock set from the host's"
+            ),
+            Err(error) => tracing::warn!(%error, "could not set the guest clock"),
+        }
+    }
+
     /// Polls the virtiofs file marker `.smolvm-ready` written by the agent
     /// after completing initialization. Includes a vsock control-channel ping
     /// fallback for agents too old to write the marker.
@@ -3840,7 +3865,13 @@ impl AgentManager {
                         Err(error) => last_probe_error = Some(error.to_string()),
                     }
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                // A resumed guest answers within milliseconds of running.
+                let poll_ms = if start.elapsed() < Duration::from_secs(1) {
+                    1
+                } else {
+                    5
+                };
+                std::thread::sleep(Duration::from_millis(poll_ms));
             }
 
             let (child_pid, child_alive) = {

@@ -1,7 +1,8 @@
 # libkrun patches for smolvm-pods
 
-`0001-anonymous-restore.patch`, `0002-readonly-input.patch` and `0003-delta-save.patch` apply, in
-that order, to the `libkrun` submodule's commit, the libkrun of the smolvm v1.31.4 Linux release.
+`0001-anonymous-restore.patch`, `0002-readonly-input.patch`, `0003-delta-save.patch` and
+`0004-clock-follow.patch` apply, in that order, to the `libkrun`
+submodule's commit, the libkrun of the smolvm v1.31.4 Linux release.
 They make the libkrun that runs pod VMs inside a smolvm-pods node: Floci's
 `tools/smolvm-pods/node/libkrun/build.sh` fetches that commit, applies them in name order and
 builds `libkrun.so`, which the node image ships in place of the release's `lib/libkrun.so`. They
@@ -62,6 +63,18 @@ blocks that span two regions, a block with one changed page, a block with every 
 a short final page, and a delta over real anonymous guest
 memory through the held save. [Pause](https://github.com/elliots/floci/blob/feat/smolvm-floci/tools/smolvm-pods/docs/architecture.md#pause) describes the whole
 pause.
+
+## Guest clock
+
+On arm64, KVM gives a guest its time through the generic timer's virtual counter, and libkrun
+wrote the counter of a checkpoint or a pause back at the restore or resume, so a guest's clocks
+stood still while it was saved and its wall clock fell behind by that long. An x86 guest's kvmclock
+moves on by the host's time instead. `0004-clock-follow.patch` does the same on arm64: a vCPU's saved
+state records the host's `CLOCK_REALTIME` when its counter was read, and a restore moves the counter
+on by the time since, before the vCPUs run; an in-process pause and resume moves it on by the time
+paused. The guest's monotonic and wall clocks then show the time gone by, as if it had run through
+it. The record is a trailer of the vCPU state, which a checkpoint without it lacks; such a checkpoint
+restores with its clock as saved. A unit test checks the trailer and the move.
 
 ## Upstreaming
 
