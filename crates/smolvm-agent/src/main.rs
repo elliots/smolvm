@@ -99,6 +99,7 @@ mod nsfile;
 mod oci;
 mod paths;
 mod pod;
+mod pod_freeze;
 #[cfg(target_os = "linux")]
 mod pod_session;
 mod port_forward;
@@ -180,7 +181,10 @@ fn raise_kernel_limits() {
 fn quiet_rcu_stall_warnings() {
     let path = "/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress";
     if let Err(error) = std::fs::write(path, "1") {
-        boot_log("WARN", &format!("turn off RCU stall warnings ({path}): {error}"));
+        boot_log(
+            "WARN",
+            &format!("turn off RCU stall warnings ({path}): {error}"),
+        );
     }
 }
 
@@ -2509,6 +2513,8 @@ fn handle_request(
         | AgentRequest::OfflineCpus { .. }
         | AgentRequest::OnlineMemory { .. }
         | AgentRequest::SetClock { .. }
+        | AgentRequest::PodFreeze
+        | AgentRequest::PodThaw
         | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
@@ -2904,6 +2910,15 @@ fn handle_request(
         AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
+
+        AgentRequest::PodFreeze => {
+            AgentResponse::from_result(pod_freeze::freeze(), error_codes::INTERNAL_ERROR)
+        }
+
+        AgentRequest::PodThaw => AgentResponse::from_result(
+            pod_freeze::thaw().map(|()| serde_json::Value::Null),
+            error_codes::INTERNAL_ERROR,
+        ),
     }
 }
 

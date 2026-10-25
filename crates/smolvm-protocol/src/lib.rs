@@ -1194,6 +1194,19 @@ pub enum AgentRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_id: Option<String>,
     },
+
+    /// Before the pod's VM pauses: freeze every pod container, then close
+    /// each TCP connection that leaves the guest, the kernel resetting it to
+    /// its peer, so that no peer keeps a connection to a sleeping pod. The
+    /// containers thaw by themselves once the guest runs again after the
+    /// pause, which its clocks show by jumping, or with
+    /// [`AgentRequest::PodThaw`], and then find those connections closed. The
+    /// agent answers with a [`PodFreezeReply`].
+    PodFreeze,
+
+    /// Thaw the containers that [`AgentRequest::PodFreeze`] froze. It does
+    /// nothing to containers that are not frozen.
+    PodThaw,
 }
 
 impl AgentRequest {
@@ -1292,6 +1305,8 @@ impl AgentRequest {
             } => format!("PodSignal {{ id: {id}, signal: {signal}, all: {all} }}"),
             AgentRequest::PodPids { id } => format!("PodPids {{ id: {id} }}"),
             AgentRequest::PodStats { id } => format!("PodStats {{ id: {id} }}"),
+            AgentRequest::PodFreeze => "PodFreeze".into(),
+            AgentRequest::PodThaw => "PodThaw".into(),
             AgentRequest::PodDelete { id, exec_id } => match exec_id {
                 Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
                 None => format!("PodDelete {{ id: {id} }}"),
@@ -1685,6 +1700,17 @@ impl MemoryStatus {
     pub fn used_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
     }
+}
+
+/// The agent's answer to [`AgentRequest::PodFreeze`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PodFreezeReply {
+    /// Whether the containers were frozen: false where the guest gives them
+    /// no cgroup of their own.
+    pub frozen: bool,
+    /// The TCP connections closed.
+    pub reset: u32,
 }
 
 /// The agent's answer to [`AgentRequest::SetClock`].
