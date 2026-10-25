@@ -160,7 +160,10 @@ mod tests {
         assert!(steps(1_000_001, true));
         assert!(steps(-1_000_001, true));
         assert!(steps(400_000_000, true), "a guest ahead is stepped back");
-        assert!(!steps(400_000_000, false), "without exact a guest ahead is left");
+        assert!(
+            !steps(400_000_000, false),
+            "without exact a guest ahead is left"
+        );
         assert!(steps(-60_000_000, false));
         assert!(steps(i64::MIN, true));
     }
