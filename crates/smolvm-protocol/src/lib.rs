@@ -18,6 +18,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A TCP destination to preserve when a pod freezes, inclusive of both ports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreservedTcpPeer {
+    /// Destination IP address.
+    pub address: std::net::IpAddr,
+    /// First destination port, inclusive.
+    pub first_port: u16,
+    /// Last destination port, inclusive.
+    pub last_port: u16,
+}
+
 /// One S3-compatible bucket to mount inside the workload container.
 ///
 /// Structured rather than a shell command: the agent mounts it natively, so
@@ -1204,6 +1215,12 @@ pub enum AgentRequest {
     /// agent answers with a [`PodFreezeReply`].
     PodFreeze,
 
+    /// Freeze as for `PodFreeze`, except for TCP connections to these peers.
+    PodFreezeExcept {
+        /// Connections to preserve across the pause.
+        keep: Vec<PreservedTcpPeer>,
+    },
+
     /// Thaw the containers that [`AgentRequest::PodFreeze`] froze. It does
     /// nothing to containers that are not frozen.
     PodThaw,
@@ -1306,6 +1323,7 @@ impl AgentRequest {
             AgentRequest::PodPids { id } => format!("PodPids {{ id: {id} }}"),
             AgentRequest::PodStats { id } => format!("PodStats {{ id: {id} }}"),
             AgentRequest::PodFreeze => "PodFreeze".into(),
+            AgentRequest::PodFreezeExcept { .. } => "PodFreezeExcept".into(),
             AgentRequest::PodThaw => "PodThaw".into(),
             AgentRequest::PodDelete { id, exec_id } => match exec_id {
                 Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
@@ -1981,6 +1999,24 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selective_freeze_has_a_distinct_wire_method_and_roundtrips_peers() {
+        let old = serde_json::to_value(super::AgentRequest::PodFreeze).unwrap();
+        assert_eq!(old["method"], "pod_freeze");
+        let peer = super::PreservedTcpPeer {
+            address: "169.254.53.1".parse().unwrap(),
+            first_port: 12000,
+            last_port: 12499,
+        };
+        let request = super::AgentRequest::PodFreezeExcept {
+            keep: vec![peer.clone()],
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(
+            matches!(serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::PodFreezeExcept { keep } if keep == vec![peer])
+        );
+    }
     #[test]
     fn memory_growth_roundtrips_numeric_geometry_only() {
         let request = super::AgentRequest::OnlineMemory {

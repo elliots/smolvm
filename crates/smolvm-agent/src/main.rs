@@ -2514,6 +2514,7 @@ fn handle_request(
         | AgentRequest::OnlineMemory { .. }
         | AgentRequest::SetClock { .. }
         | AgentRequest::PodFreeze
+        | AgentRequest::PodFreezeExcept { .. }
         | AgentRequest::PodThaw
         | AgentRequest::Shutdown { .. } => {}
         _ => {
@@ -2912,7 +2913,11 @@ fn handle_request(
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
 
         AgentRequest::PodFreeze => {
-            AgentResponse::from_result(pod_freeze::freeze(), error_codes::INTERNAL_ERROR)
+            AgentResponse::from_result(pod_freeze::freeze(&[]), error_codes::INTERNAL_ERROR)
+        }
+
+        AgentRequest::PodFreezeExcept { keep } => {
+            AgentResponse::from_result(pod_freeze::freeze(&keep), error_codes::INTERNAL_ERROR)
         }
 
         AgentRequest::PodThaw => AgentResponse::from_result(

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use smolvm_protocol::PodFreezeReply;
+use smolvm_protocol::{PodFreezeReply, PreservedTcpPeer};
 
 /// The pod-cgroup parent that every pod container's cgroup is under.
 const POD_CGROUP: &str = "/sys/fs/cgroup/smolvm";
@@ -34,7 +34,13 @@ const WATCH_GAP: Duration = Duration::from_millis(250);
 static WATCHER: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 /// `PodFreeze`.
-pub fn freeze() -> Result<PodFreezeReply, String> {
+pub fn freeze(keep: &[PreservedTcpPeer]) -> Result<PodFreezeReply, String> {
+    if keep
+        .iter()
+        .any(|peer| peer.first_port == 0 || peer.first_port > peer.last_port)
+    {
+        return Err("a preserved TCP peer must have a nonempty port range".into());
+    }
     let frozen = has_pod_cgroup();
     if frozen {
         // Before the freeze, so that a freeze that fails part way still
@@ -42,7 +48,7 @@ pub fn freeze() -> Result<PodFreezeReply, String> {
         watch_for_resume();
         set_frozen(true)?;
     }
-    let reset = reset_connections()?;
+    let reset = reset_connections(keep)?;
     tracing::info!(frozen, reset, "pod frozen for a pause");
     Ok(PodFreezeReply { frozen, reset })
 }
@@ -123,7 +129,7 @@ fn watch_for_resume() {
 use diag::reset_connections;
 
 #[cfg(not(target_os = "linux"))]
-fn reset_connections() -> Result<u32, String> {
+fn reset_connections(_keep: &[PreservedTcpPeer]) -> Result<u32, String> {
     Ok(0)
 }
 
@@ -131,6 +137,7 @@ fn reset_connections() -> Result<u32, String> {
 /// `SOCK_DESTROY`.
 #[cfg(target_os = "linux")]
 mod diag {
+    use smolvm_protocol::PreservedTcpPeer;
     use std::io;
     use std::net::Ipv4Addr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -166,6 +173,23 @@ mod diag {
     }
 
     impl Sock {
+        fn is_preserved(&self, keep: &[PreservedTcpPeer]) -> bool {
+            let port = u16::from_be_bytes([self.id[2], self.id[3]]);
+            let address = match self.family as libc::c_int {
+                libc::AF_INET => std::net::IpAddr::V4(v4(&self.id[20..24]).unwrap()),
+                _ => {
+                    let ip =
+                        std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&self.id[20..36]).unwrap());
+                    ip.to_ipv4_mapped()
+                        .map(std::net::IpAddr::V4)
+                        .unwrap_or(std::net::IpAddr::V6(ip))
+                }
+            };
+            keep.iter().any(|peer| {
+                peer.address == address && (peer.first_port..=peer.last_port).contains(&port)
+            })
+        }
+
         /// Whether both ends are in the guest: the peer is a loopback
         /// address, or the guest's own address.
         pub fn is_internal(&self) -> bool {
@@ -347,13 +371,13 @@ mod diag {
 
     /// Closes every TCP connection that leaves the guest, and returns how
     /// many it closed.
-    pub fn reset_connections() -> Result<u32, String> {
+    pub fn reset_connections(keep: &[PreservedTcpPeer]) -> Result<u32, String> {
         let fd = socket().map_err(|e| format!("open sock_diag: {e}"))?;
         let mut reset = 0;
         let mut seq = 2;
         for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
             for sock in dump(&fd, family)? {
-                if sock.is_internal() {
+                if sock.is_internal() || sock.is_preserved(keep) {
                     continue;
                 }
                 seq += 1;
@@ -427,6 +451,41 @@ mod diag {
             assert!(sock(v6, sockid(mapped(pod), mapped([127, 0, 0, 1]))).is_internal());
             let localhost = std::net::Ipv6Addr::LOCALHOST.octets();
             assert!(sock(v6, sockid(localhost, localhost)).is_internal());
+        }
+
+        #[test]
+        fn only_the_named_destination_and_port_range_are_preserved() {
+            let pod = [10, 42, 0, 17];
+            let destination = [169, 254, 53, 1];
+            let peer = PreservedTcpPeer {
+                address: Ipv4Addr::from(destination).into(),
+                first_port: 12000,
+                last_port: 12499,
+            };
+            for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+                for (port, expected) in [
+                    (11999u16, false),
+                    (12000, true),
+                    (12499, true),
+                    (12500, false),
+                ] {
+                    let mut id = if family == libc::AF_INET as u8 {
+                        v4_id(pod, destination)
+                    } else {
+                        sockid(mapped(pod), mapped(destination))
+                    };
+                    id[2..4].copy_from_slice(&port.to_be_bytes());
+                    let sock = Sock {
+                        family,
+                        state: 1,
+                        id,
+                    };
+                    assert_eq!(sock.is_preserved(std::slice::from_ref(&peer)), expected);
+                    let mut other = peer.clone();
+                    other.address = Ipv4Addr::new(169, 254, 53, 2).into();
+                    assert!(!sock.is_preserved(&[other]));
+                }
+            }
         }
 
         #[test]
